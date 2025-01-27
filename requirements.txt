@@ -1,2 +1,3 @@
 pylablib
+pythonnet
 opencv-python

@@ -1,4 +1,4 @@
-import opencv-python as cv2 
+import cv
 import numpy as np
 from PIL import Image
 
