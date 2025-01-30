@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 
-# Title: upLED and upTEMP in Python with CTypes. 
+# Title: upLED and upTEMP in Python with CTypes.
 # Created Date: 2022 - 11 - 21
 # Last modified date: 2024 - 04 - 02
 # Python Version Used: python3
@@ -51,7 +51,7 @@ if (modelName.value).decode() == "upLED":
 
     #Enables the use of LEDs without EEPROM (non-Thorlabs or unmounted LEDs).
     print(lib.TLUP_setLedUseNonThorlabsLed(upHandle, 1))
-    
+
     #Make sure the LED is switched off (0 = off, 1 = on).
     lib.TLUP_switchLedOutput(upHandle,0)
 
@@ -64,7 +64,7 @@ if (modelName.value).decode() == "upLED":
     LEDCurrentLimit = c_double()
     LEDForwardVoltage = c_double()
     LEDWavelength = c_double(0)
-    
+
     lib.TLUP_getLedInfo(upHandle, LEDName, LEDSerialNumber, byref(LEDCurrentLimit),
                         byref(LEDForwardVoltage), byref(LEDWavelength))
 
@@ -93,9 +93,9 @@ if (modelName.value).decode() == "upLED":
             print("Code will be stopped.")
             exit()
         lib.TLUP_setLedCurrentSetpoint(upHandle, currentSetpoint)
-        print("LED current set to", currentSetpoint.value*1000, "mA.")            
+        print("LED current set to", currentSetpoint.value*1000, "mA.")
 
-    
+
     #Switch the LED on, wait for 2 sec, then switch it off again.
     lib.TLUP_switchLedOutput(upHandle,1)
     print("Switch LED on.")
@@ -103,66 +103,10 @@ if (modelName.value).decode() == "upLED":
     time.sleep(2)
     lib.TLUP_switchLedOutput(upHandle,0)
     print("Switch LED off.")
-    
-#If the device is an upTEMP, this section is executed.
-elif (modelName.value).decode() == "upTEMP":
 
-    #Configure which type of temperature sensor is connected (here: thermistor)
-    #
-    #TLUP_TEMP_SENS_8TH  (0): 8 thermistor channels are available
-    #TLUP_TEMP_SENS_8TC  (1): 8 thermocouple channels are available
-    #TLUP_TEMP_SENS_4RTD (2): 4 resistance temperature device (RTD) (e.g. Pt100) channels are available
-    lib.TLUP_setTempSensConfig(upHandle, c_int(0))
-
-    #Configure which temperature unit is used (here: Celsius)
-    #
-    #TLUP_TEMP_U_KELVIN  (0): Kelvin
-    #TLUP_TEMP_U_CELSIUS (1): Celsius
-    #TLUP_TEMP_U_FAHREN  (2): Fahrenheit
-    lib.TLUP_setTempUnit(upHandle, c_int(1))
-
-    #Configure the characteristics of the thermistor
-    #
-    #Here the T0, R0, beta parameters of the thermistor are known and are used to determine the corresponding Steinhart-Hart coefficients.
-    t0 = c_double(298.15)
-    r0 = c_double(10000.0)
-    beta = c_double(3900.0)
-    
-    steinhartHartParameterA = c_double()
-    steinhartHartParameterB = c_double()
-    steinhartHartParameterC = c_double()
-    steinhartHartParameterD = c_double()
-    steinhartHartParameterE = c_double()
-    steinhartHartParameterF = c_double()    
-
-    lib.TLUP_getSteinhartHartParameterFromExponentialParameterConvertion(
-        upHandle, t0, r0, beta,
-        byref(steinhartHartParameterA), byref(steinhartHartParameterB),
-        byref(steinhartHartParameterC), byref(steinhartHartParameterD),
-        byref(steinhartHartParameterE), byref(steinhartHartParameterF))
-
-    #Channel 1 is configured with the calculated Steinhart-Hart coefficients.
-    CH1 = c_int(1)
-    lib.TLUP_setThermSensConfig(upHandle, CH1, c_int(3),
-                                steinhartHartParameterA, steinhartHartParameterB,
-                                steinhartHartParameterC, steinhartHartParameterD,
-                                steinhartHartParameterE, steinhartHartParameterF)
-
-    #Temperature measurements are enabled.
-    lib.TLUP_setTempMeasurementState(upHandle, c_int(1))
-    
-    #Temperature measurements are performed and new temperature values are printed to the screen.
-    temperature = c_double()
-    isNew = c_bool()
-    for x in range(1000):
-        lib.TLUP_measTempTemperature (upHandle, CH1, byref(temperature), byref(isNew))
-        if isNew:
-            print("Measured temperature: ", temperature.value)
-
-    
 #If the device is neither an upLED nor an upTEMP, this section is executed.
 else:
     print("upSeries device type is not yet supported by this example.")
-    
+
 #Connection to the upSeries device is closed.
 lib.TLUP_close(upHandle)

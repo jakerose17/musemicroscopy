@@ -50,7 +50,8 @@ new_exposure = float(input("New Exposure: "))
 camera.set_exposure(new_exposure)
 
 
-
+pf = cam.get_color_format()
+print("Pixel format:", pf)
 
 
 
@@ -124,16 +125,24 @@ print("Switch LED on.")
 
 
 
-
+camera.set_gain(10)
 camera.start_acquisition()
 k = input("Enter to grab")
 image = camera.grab(1)[0]
+print("Data type:", image.dtype)
 image_array = np.array(image)
+print("Min/max pixel value:", image.min(), image.max())
+
 print("Image shape: ", image_array.shape)
+
+min_val = image_array.min()
+max_val = image_array.max()
+scaled = (image_array - min_val) / (max_val - min_val + 1e-6) * 255
+display_frame = scaled.astype(np.uint8)
 k = input("Enter to save")
 image_path = r"C:\Users\Public\musemicroscopy\captured_image.png"
 image_uint8 = (image_array / image_array.max() * 255).astype('uint8')
-cv2.imwrite(image_path, image_uint8)
+cv2.imwrite(image_path, display_frame)
 camera.stop_acquisition()
 
 

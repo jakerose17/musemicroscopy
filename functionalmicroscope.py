@@ -6,64 +6,92 @@ import numpy as np
 
 from ctypes import cdll, c_uint32, c_int, c_double, byref, create_string_buffer
 
-from PyQt5.QtCore import Qt, QTimer, pyqtSlot
-from PyQt5.QtGui import QPixmap, QImage
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, pyqtSlot
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QPushButton, QVBoxLayout,
     QHBoxLayout, QSlider, QSpinBox, QGroupBox, QGridLayout, QCheckBox, QLineEdit
 )
+from PyQt5.QtGui import QPixmap, QImage
 
 import pylablib as pll
 from pylablib.devices import Thorlabs
 
+
 ###############################################################################
-# MicroscopeHardware: integrates camera + LED code
+# Background Thread for Camera Acquisition
+###############################################################################
+class CameraWorker(QThread):
+    """
+    Continuously grabs frames from the Thorlabs camera in a separate thread.
+    Emits `new_frame` whenever a frame arrives.
+    """
+    new_frame = pyqtSignal(np.ndarray)
+
+    def __init__(self, camera, parent=None):
+        super().__init__(parent)
+        self.camera = camera
+        self.running = True
+
+    def run(self):
+        # Continuous loop to grab frames
+        while self.running:
+            frame_list = self.camera.grab(1)  # blocks until a frame is ready
+            if frame_list:
+                frame = np.array(frame_list[0])
+                min_val = frame.min()
+                max_val = frame.max()
+                scaled = (frame - min_val) / (max_val - min_val + 1e-6) * 255
+                display_frame = scaled.astype(np.uint8)
+                self.new_frame.emit(display_frame)
+            # Optional small sleep to reduce CPU usage if frame rate is high:
+            # time.sleep(0.01)
+
+
+
+    def stop(self):
+        self.running = False
+        self.wait()  # wait for thread to finish cleanly
+
+
+###############################################################################
+# MicroscopeHardware: Holds camera/LED logic and references last_frame
 ###############################################################################
 class MicroscopeHardware:
     """
     Integrates:
       - The Thorlabs camera (via pylablib)
       - The Thorlabs upSeries LED driver (via TLUP_64.dll)
-    and provides methods to control exposure, turn LED on/off, and capture images.
+    Provides methods to control exposure, turn LED on/off, etc.
+    Also stores the most recently received frame in `self.last_frame`.
     """
 
     def __init__(self):
         """Initialize hardware connections here."""
-        # 1) Initialize LED hardware
         self.upHandle = None
-        self._init_led_hardware()
-
-        # 2) Initialize camera hardware
         self.camera = None
+        self.last_frame = None  # store the latest frame from the worker
+
+        # 1) Initialize LED hardware
+        self._init_led_hardware()
+        # 2) Initialize camera hardware
         self._init_camera_hardware()
 
     def _init_camera_hardware(self):
-        """
-        Initialize the Thorlabs camera using pylablib.
-        Replace 'path/to/dlls' if needed, or remove if your environment is set.
-        """
-        # Point pylablib to the Thorlabs camera DLLs if needed
+        """Initialize the Thorlabs camera using pylablib."""
         pll.par["devices/dlls/thorlabs_tlcam"] = "path/to/dlls"
-
-        # List available cameras
         cameras = Thorlabs.list_cameras_tlcam()
         if not cameras:
             print("No Thorlabs cameras found.")
             return
-
-        # Connect to the first camera found
         self.camera = Thorlabs.ThorlabsTLCamera(serial=cameras[0])
         print(f"Connected to camera: {cameras[0]}")
 
-        # Start the camera with a default exposure (or 50 ms, etc.)
-        default_exposure = 50.0  # ms
+        default_exposure = 0.1  # ms
         self.camera.set_exposure(default_exposure)
-        print("Camera exposure set to", default_exposure, "ms")
+        print(f"Camera exposure set to {default_exposure} ms")
 
     def _init_led_hardware(self):
-        """
-        Load the LED driver DLL, connect to the first device, and configure it.
-        """
+        """Load the LED driver DLL, connect to the first device, and configure it."""
         dll_path = r"C:\Program Files\IVI Foundation\VISA\Win64\Bin\TLUP_64.dll"
         try:
             lib = cdll.LoadLibrary(dll_path)
@@ -71,7 +99,6 @@ class MicroscopeHardware:
             print(f"Failed to load LED DLL at {dll_path}. Check path.")
             return
 
-        # Find devices
         deviceCount = c_uint32()
         lib.TLUP_findRsrc(0, byref(deviceCount))
         if deviceCount.value == 0:
@@ -79,15 +106,13 @@ class MicroscopeHardware:
             return
         print("Number of upSeries devices found:", deviceCount.value)
 
-        # Read model & serial
         modelName = create_string_buffer(256)
         serialNumber = create_string_buffer(256)
         lib.TLUP_getRsrcInfo(0, 0, modelName, serialNumber, 0, 0)
         print("Connecting to this device:")
-        print("Model name:", modelName.value.decode(), 
+        print("Model name:", modelName.value.decode(),
               ", Serial number:", serialNumber.value.decode())
 
-        # Initialize device
         upName = create_string_buffer(256)
         lib.TLUP_getRsrcName(0, 0, upName)
         upHandle = c_int(0)
@@ -96,160 +121,138 @@ class MicroscopeHardware:
             print("Failed to initialize LED device.")
             return
 
-        # Store references for later use
         self.led_lib = lib
         self.upHandle = upHandle
 
-        # Enable the use of non-Thorlabs or unmounted LEDs
+        # Enable use of non-Thorlabs/unmounted LEDs
         self.led_lib.TLUP_setLedUseNonThorlabsLed(self.upHandle, 1)
-
-        # Make sure the LED is off
+        # Turn off LED initially
         self.led_lib.TLUP_switchLedOutput(self.upHandle, 0)
 
-        # Attempt to read LED info (works only if it has EEPROM)
+        # Try to read LED info (only works if there's an EEPROM)
         LEDName = create_string_buffer(256)
         LEDSerialNumber = create_string_buffer(256)
         LEDCurrentLimit = c_double()
         LEDForwardVoltage = c_double()
         LEDWavelength = c_double(0)
-
         self.led_lib.TLUP_getLedInfo(self.upHandle, LEDName, LEDSerialNumber,
                                      byref(LEDCurrentLimit),
                                      byref(LEDForwardVoltage),
                                      byref(LEDWavelength))
-
-        # If the LED has EEPROM data (Thorlabs mounted LED)
         if LEDWavelength.value != 0:
             print("EEPROM on LED detected.")
-            print("Connected LED:", LEDName.value.decode(), 
+            print("Connected LED:", LEDName.value.decode(),
                   ", serial:", LEDSerialNumber.value.decode(),
                   ", wavelength [nm]:", LEDWavelength.value)
-            print("Max LED current [A]:", LEDCurrentLimit.value, 
+            print("Max LED current [A]:", LEDCurrentLimit.value,
                   ", max forward voltage [V]:", LEDForwardVoltage.value)
-
-            # Example: set current to 10% of limit
             currentSetpoint = c_double(0.1 * LEDCurrentLimit.value)
             self.led_lib.TLUP_setLedCurrentSetpoint(self.upHandle, currentSetpoint)
             time.sleep(1)
             print("LED current set to 10% of limit.")
         else:
-            print("No EEPROM on LED detected.")
-            print("Defaulting to 1mA current.")
-            currentSetpoint = c_double(0.001)  # 1 mA
+            print("No EEPROM on LED detected. Defaulting to 1mA current.")
+            currentSetpoint = c_double(0.001)
             self.led_lib.TLUP_setLedCurrentSetpoint(self.upHandle, currentSetpoint)
 
         print("LED init complete.\n")
 
     def start_camera(self):
-        """Begin continuous acquisition if supported by the driver."""
+        """Start continuous acquisition (called before starting the worker)."""
         if self.camera:
             self.camera.start_acquisition()
             print("Camera acquisition started.")
 
     def stop_camera(self):
-        """Stop the camera acquisition."""
         if self.camera:
             self.camera.stop_acquisition()
             print("Camera acquisition stopped.")
 
-    def get_frame(self):
-        """
-        Retrieve the latest frame from the camera as a numpy array (H, W, 3).
-        If the camera is monochrome, you might get (H, W, 1) or just (H, W).
-        """
-        if not self.camera:
-            return None
-        frame_list = self.camera.grab(1)
-        if not frame_list:
-            return None
+    def close_hardware(self):
+        if self.camera:
+            self.camera.close()
+            print("Camera closed.")
+            self.camera = None
 
-        image = frame_list[0]
-        image_array = np.array(image)
-
-        # Convert to RGB if needed or at least 3-channel for display
-        if len(image_array.shape) == 2:
-            # Monochrome: Expand to 3 channels for QImage.Format_RGB888
-            image_array = np.stack((image_array,)*3, axis=-1)
-
-        return image_array
+        if self.upHandle and self.led_lib:
+            self.led_lib.TLUP_close(self.upHandle)
+            self.upHandle = None
+            print("LED device closed.")
 
     def set_exposure(self, exposure_ms):
-        """Set camera exposure in milliseconds via the GUI slider."""
         if self.camera:
             self.camera.set_exposure(float(exposure_ms))
             print(f"Camera exposure set to {exposure_ms} ms")
 
     def move_stage(self, x=None, y=None, z=None):
-        """
-        Placeholder for stage movement. Replace with actual stage commands.
-        """
-        # If you have a real stage: call move_relative(x, y, z) or move_absolute().
+        """Placeholder for motorized stage movement."""
         print(f"[STAGE] Moving: X={x}, Y={y}, Z={z} (placeholder)")
 
     def turn_on_led(self):
-        """Turn on the white LED using the upSeries driver."""
         if self.upHandle and self.led_lib:
             self.led_lib.TLUP_switchLedOutput(self.upHandle, 1)
             print("[LED] Turned on.")
 
     def turn_off_led(self):
-        """Turn off the white LED."""
         if self.upHandle and self.led_lib:
             self.led_lib.TLUP_switchLedOutput(self.upHandle, 0)
             print("[LED] Turned off.")
 
     def capture_and_save_image(self):
         """
-        Example method to:
+        Auto Capture:
           1) Turn LED on
-          2) Capture a single frame
-          3) Save to the Downloads folder
-          4) Turn LED off
+          2) Wait briefly
+          3) Grab a single frame (blocking)
+          4) Save
+          5) Turn LED off
         """
-        # Turn on LED
+        if not self.camera:
+            print("No camera available for auto capture!")
+            return
         self.turn_on_led()
+        time.sleep(0.5)  # let LED stabilize
 
-        # Short delay (if needed) to ensure LED stable
-        time.sleep(0.5)
-
-        # Grab one frame
-        frame = self.get_frame()
-        if frame is not None:
-            # Convert to uint8 for saving
-            if frame.max() > 0:
-                frame_uint8 = (frame / frame.max() * 255).astype('uint8')
-            else:
-                frame_uint8 = frame.astype('uint8')
-
-            # Path to downloads folder
-            downloads = os.path.join(os.path.expanduser("~"), "Downloads")
-            image_path = os.path.join(downloads, "captured_image.png")
-            cv2.imwrite(image_path, frame_uint8)
-            print(f"[CAPTURE] Saved image to {image_path}")
+        frame_list = self.camera.grab(1)
+        if frame_list:
+            frame = np.array(frame_list[0])
+            self._save_frame_to_downloads(frame, "captured_image.png")
         else:
             print("[CAPTURE] No frame received from camera!")
-
-        # Turn off LED
         self.turn_off_led()
 
-    def close_hardware(self):
-        """Close camera and LED gracefully."""
-        # Close camera
-        if self.camera:
-            self.camera.close()
-            print("Camera closed.")
-            self.camera = None
+    def save_last_frame(self):
+        """
+        Save the most recently received (live) frame from the worker
+        without toggling the LED or waiting again.
+        """
+        if self.last_frame is None:
+            print("[SAVE] No current frame available to save!")
+            return
+        self._save_frame_to_downloads(self.last_frame, "current_frame.png")
 
-        # Close LED
-        if self.upHandle and self.led_lib:
-            self.led_lib.TLUP_close(self.upHandle)
-            self.upHandle = None
-            print("LED device closed.")
+    def _save_frame_to_downloads(self, frame, filename):
+        """
+        Common utility method to scale, convert, and save a frame to the Downloads folder.
+        """
+        if frame.max() > 0:
+            frame_uint8 = (frame / frame.max() * 255).astype('uint8')
+        else:
+            frame_uint8 = frame.astype('uint8')
+
+        downloads = os.path.join(os.path.expanduser("~"), "Downloads")
+        image_path = os.path.join(downloads, filename)
+        cv2.imwrite(image_path, frame_uint8)
+        print(f"[SAVE] Saved image to {image_path}")
+
 
 ###############################################################################
-# CameraDisplayWidget
+# Camera Display Widget
 ###############################################################################
 class CameraDisplayWidget(QLabel):
+    """
+    A QLabel that displays the camera frame. Updated via signal from the worker.
+    """
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setAlignment(Qt.AlignCenter)
@@ -258,24 +261,28 @@ class CameraDisplayWidget(QLabel):
     def update_frame(self, frame):
         if frame is None:
             return
+        # Convert to 3 channels if needed
+        if len(frame.shape) == 2:
+            frame = np.stack((frame,)*3, axis=-1)
+
         height, width, channel = frame.shape
         bytes_per_line = channel * width
-
-        # Create QImage
         qimg = QImage(frame.data, width, height, bytes_per_line, QImage.Format_RGB888)
-        # Convert to QPixmap and scale
         pixmap = QPixmap.fromImage(qimg)
         scaled_pixmap = pixmap.scaled(self.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
         self.setPixmap(scaled_pixmap)
 
+
 ###############################################################################
-# ControlPanelWidget
+# Control Panel Widget
 ###############################################################################
 class ControlPanelWidget(QWidget):
+    """
+    Manual controls for stage, LEDs, camera, plus capture/save buttons.
+    """
     def __init__(self, hardware: MicroscopeHardware, parent=None):
         super().__init__(parent)
         self.hardware = hardware
-
         layout = QVBoxLayout()
         self.setLayout(layout)
 
@@ -320,13 +327,29 @@ class ControlPanelWidget(QWidget):
 
         layout.addWidget(stage_group)
 
-        # LED Controls (Simple On/Off for White LED)
-        led_group = QGroupBox("White LED Controls")
-        led_layout = QHBoxLayout()
+        # LED Controls
+        led_group = QGroupBox("LED Controls")
+        led_layout = QGridLayout()
         led_group.setLayout(led_layout)
-        self.led_checkbox = QCheckBox("LED On/Off")
-        self.led_checkbox.stateChanged.connect(self.white_led_toggled)
-        led_layout.addWidget(self.led_checkbox)
+
+        self.uv_led_checkbox = QCheckBox("UV LED")
+        self.uv_intensity_edit = QLineEdit("255")
+        self.uv_intensity_edit.setFixedWidth(50)
+        self.uv_led_checkbox.stateChanged.connect(self.uv_led_toggled)
+
+        self.white_led_checkbox = QCheckBox("White LED")
+        self.white_intensity_edit = QLineEdit("255")
+        self.white_intensity_edit.setFixedWidth(50)
+        self.white_led_checkbox.stateChanged.connect(self.white_led_toggled)
+
+        led_layout.addWidget(self.uv_led_checkbox, 0, 0)
+        led_layout.addWidget(QLabel("Intensity:"), 0, 1)
+        led_layout.addWidget(self.uv_intensity_edit, 0, 2)
+
+        led_layout.addWidget(self.white_led_checkbox, 1, 0)
+        led_layout.addWidget(QLabel("Intensity:"), 1, 1)
+        led_layout.addWidget(self.white_intensity_edit, 1, 2)
+
         layout.addWidget(led_group)
 
         # Camera Controls
@@ -335,20 +358,54 @@ class ControlPanelWidget(QWidget):
         camera_group.setLayout(camera_layout)
 
         camera_layout.addWidget(QLabel("Exposure (ms):"))
+
+        # Slider: range 0.01..1.0 ms (scaled by 100)
         self.exposure_slider = QSlider(Qt.Horizontal)
-        self.exposure_slider.setRange(1, 1000)
-        self.exposure_slider.setValue(50)
-        self.exposure_slider.valueChanged.connect(self.exposure_changed)
+        self.exposure_slider.setRange(1, 100)  # 0.01..1.0
+        self.exposure_slider.setValue(10)      # default=0.10 ms
+        self.exposure_slider.valueChanged.connect(self.update_exposure_from_slider)
         camera_layout.addWidget(self.exposure_slider)
+
+        # QLineEdit for direct exposure input
+        self.exposure_edit = QLineEdit("0.10")
+        self.exposure_edit.setFixedWidth(60)
+        self.exposure_edit.editingFinished.connect(self.update_slider_from_exposure)
+        camera_layout.addWidget(self.exposure_edit)
 
         layout.addWidget(camera_group)
 
-        # Capture button (turn on LED, snap one photo, save)
-        self.capture_button = QPushButton("Capture & Save")
-        self.capture_button.clicked.connect(self.capture_button_clicked)
+        # Buttons: Auto Capture, Save Current
+        self.capture_button = QPushButton("Auto Capture")
+        self.capture_button.clicked.connect(self.auto_capture_clicked)
         layout.addWidget(self.capture_button)
 
+        self.save_button = QPushButton("Save Current Photo")
+        self.save_button.clicked.connect(self.save_current_photo_clicked)
+        layout.addWidget(self.save_button)
+
         layout.addStretch()
+
+    def update_exposure_from_slider(self, slider_value):
+        exposure_ms = slider_value / 100.0
+        self.exposure_edit.setText(f"{exposure_ms:.2f}")
+        self.hardware.set_exposure(exposure_ms)
+
+    def update_slider_from_exposure(self):
+        try:
+            entered_value = float(self.exposure_edit.text())
+        except ValueError:
+            slider_val = self.exposure_slider.value()
+            self.exposure_edit.setText(f"{slider_val/100:.2f}")
+            return
+
+        if entered_value < 0.01:
+            entered_value = 0.01
+        elif entered_value > 1.0:
+            entered_value = 1.0
+
+        slider_val = int(round(entered_value * 100))
+        self.exposure_slider.setValue(slider_val)
+        self.hardware.set_exposure(entered_value)
 
     @pyqtSlot()
     def move_x_clicked(self):
@@ -366,22 +423,35 @@ class ControlPanelWidget(QWidget):
         self.hardware.move_stage(x=None, y=None, z=step)
 
     @pyqtSlot(int)
-    def exposure_changed(self, value):
-        self.hardware.set_exposure(value)
+    def uv_led_toggled(self, state):
+        if state == Qt.Checked:
+            # In real code, set UV intensity, etc.
+            self.hardware.turn_on_led()
+        else:
+            self.hardware.turn_off_led()
 
     @pyqtSlot(int)
     def white_led_toggled(self, state):
         if state == Qt.Checked:
+            # In real code, set White intensity, etc.
             self.hardware.turn_on_led()
         else:
             self.hardware.turn_off_led()
 
     @pyqtSlot()
-    def capture_button_clicked(self):
+    def auto_capture_clicked(self):
         """
-        Turns on LED, captures one frame, saves image, turns off LED.
+        Calls hardware.capture_and_save_image().
+        This toggles the LED, grabs one frame, saves it, turns off LED.
         """
         self.hardware.capture_and_save_image()
+
+    @pyqtSlot()
+    def save_current_photo_clicked(self):
+        """
+        Save the frame that is currently displayed (from the live view).
+        """
+        self.hardware.save_last_frame()
 
 
 ###############################################################################
@@ -392,13 +462,11 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("Microscope Control UI")
 
-        # Initialize hardware
+        # 1) Initialize hardware
         self.hardware = MicroscopeHardware()
-
-        # If camera/LED were successfully initialized, start camera
         self.hardware.start_camera()
 
-        # Central widget layout
+        # 2) Set up central UI
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         main_layout = QHBoxLayout()
@@ -412,21 +480,33 @@ class MainWindow(QMainWindow):
         self.control_panel = ControlPanelWidget(self.hardware)
         main_layout.addWidget(self.control_panel, stretch=1)
 
-        # Timer for live camera updates
-        self.timer = QTimer()
-        self.timer.timeout.connect(self.update_camera)
-        self.timer.start(100)  # 10 fps
+        # 3) Create a separate worker thread to grab frames continuously
+        if self.hardware.camera:
+            self.camera_thread = CameraWorker(self.hardware.camera)
+            self.camera_thread.new_frame.connect(self.on_new_frame)
+            self.camera_thread.start()
+        else:
+            self.camera_thread = None
+
+    @pyqtSlot(np.ndarray)
+    def on_new_frame(self, frame):
+        """
+        Called whenever the worker has a new frame.
+        Update the display, store in hardware.last_frame.
+        """
+        self.hardware.last_frame = frame
+        self.camera_display.update_frame(frame)
 
     def closeEvent(self, event):
-        """Cleanup hardware on exit."""
+        """Clean up camera thread and hardware on exit."""
+        # Stop background thread
+        if self.camera_thread and self.camera_thread.isRunning():
+            self.camera_thread.stop()
+
         self.hardware.stop_camera()
         self.hardware.close_hardware()
         super().closeEvent(event)
 
-    def update_camera(self):
-        """Grab current frame and display it."""
-        frame = self.hardware.get_frame()
-        self.camera_display.update_frame(frame)
 
 ###############################################################################
 # Entry Point
@@ -436,6 +516,7 @@ def main():
     window = MainWindow()
     window.show()
     sys.exit(app.exec_())
+
 
 if __name__ == "__main__":
     main()

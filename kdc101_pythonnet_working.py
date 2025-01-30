@@ -22,13 +22,13 @@ def main():
     try:
         # Create new device
         serial_no = str("27601181")
-        
+
         #devices = DeviceManagerCLI.GetDeviceList(KCubeDCServo.DevicePrefix)
         #if len(devices)==0:
         #    print("No KCube devices found.")
         #    return
         #serial_no = devices[0]
-        
+
         DeviceManagerCLI.BuildDeviceList()
 
         device = KCubeDCServo.CreateKCubeDCServo(serial_no)
