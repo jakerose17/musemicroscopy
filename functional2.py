@@ -3,6 +3,7 @@ import os
 import time
 import cv2
 import numpy as np
+import datetime
 
 # ------------------------------
 # .NET / Kinesis motion imports
@@ -22,10 +23,10 @@ from System import Decimal, Int32
 # ------------------------------
 # PyQt imports
 # ------------------------------
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, pyqtSlot
+from PyQt5.QtCore import Qt, QThread, QTimer, pyqtSignal, pyqtSlot
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QPushButton, QVBoxLayout,
-    QHBoxLayout, QSlider, QDoubleSpinBox, QGroupBox, QGridLayout, QCheckBox, QLineEdit
+    QHBoxLayout, QSlider, QDoubleSpinBox, QSpinBox, QComboBox, QGroupBox, QGridLayout, QCheckBox, QLineEdit, QProgressBar
 )
 from PyQt5.QtGui import QPixmap, QImage
 
@@ -45,16 +46,6 @@ from ctypes import cdll, c_uint32, c_int, c_double, byref, create_string_buffer
 # MotionController: Manages 3 Axes with Kinesis using Absolute Moves
 ###############################################################################
 class MotionController:
-    """
-    Controls 3 Thorlabs KCube DC Servos via the Kinesis .NET API.
-    Axis → Serial Number:
-      X: 27601188
-      Y: 27601181
-      Z: 27265400
-
-    All moves are performed as absolute moves using MoveTo.
-    The step size is given in millimeters.
-    """
     def __init__(self):
         self.axis_info = {
             "X": "27601188",
@@ -84,9 +75,12 @@ class MotionController:
                 DeviceConfiguration.DeviceSettingsUseOptionType.UseFileSettings)
             m_config.UpdateCurrentConfiguration()
             device.SetSettings(device.MotorDeviceSettings, True, False)
-            print(f"Homing axis {axis} (serial {serial_no})...")
-            device.Home(60000)
-            print(f"[{axis}] Homing complete. Current pos:", device.Position)
+            if device.Position == Decimal(0):
+                print(f"Homing axis {axis} (serial {serial_no})...")
+                device.Home(60000)
+                print(f"[{axis}] Homing complete. Current pos:", device.Position)
+            else:
+                print(f"Already homed.  Current pos:", device.Position)
             self.devices[axis] = device
 
     def move_axis_relative(self, axis, step_mm):
@@ -119,59 +113,251 @@ class MotionController:
 
 
 ###############################################################################
-# Background Thread for Camera Acquisition
+# StageMoveWorker: Runs a stage move command in a separate thread.
+###############################################################################
+class StageMoveWorker(QThread):
+    finished_move = pyqtSignal()
+
+    def __init__(self, hardware, axis, step_mm, parent=None):
+        super().__init__(parent)
+        self.hardware = hardware  # MicroscopeHardware instance
+        self.axis = axis
+        self.step_mm = step_mm
+
+    def run(self):
+        self.hardware._move_axis_absolute(self.axis, self.step_mm)
+        self.finished_move.emit()
+
+
+###############################################################################
+# AutoCaptureWorker: Runs an automatic capture sequence in a separate thread.
+###############################################################################
+class AutoCaptureWorker(QThread):
+    finished_capture = pyqtSignal()
+    # Emit: captures_completed, total_captures, estimated_time_remaining (in seconds)
+    progress_update = pyqtSignal(int, int, float)
+
+    def __init__(self, hardware, mode, overlap, num_stack, pattern_size_x, pattern_size_y, z_stack_height, parent=None):
+        super().__init__(parent)
+        self.hardware = hardware  # MicroscopeHardware instance
+        self.mode = mode            # "Focus Stack", "XY Pattern", or "Combined"
+        self.overlap = overlap
+        self.num_stack = num_stack
+        self.pattern_size_x = pattern_size_x
+        self.pattern_size_y = pattern_size_y
+        self.z_stack_height = z_stack_height
+
+        # Define per-capture time estimates (in seconds) based on your sample timings.
+        self.time_estimates = {
+            "Focus Stack": 3.0,
+            "XY Pattern": 7.0,
+            "Combined": 4.7
+        }
+
+    def run(self):
+        # Create a folder for this auto capture session.
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        downloads = os.path.join(os.path.expanduser("~"), "Downloads")
+        folder_name = os.path.join(downloads, f"AutoCapture_{timestamp}")
+        os.makedirs(folder_name, exist_ok=True)
+        self.hardware.auto_capture_folder = folder_name
+
+        # Pause continuous acquisition during auto capture.
+        self.hardware.auto_capture_in_progress = True
+
+        # Get current stage positions
+        current_x = self._get_current_coordinate('X')
+        current_y = self._get_current_coordinate('Y')
+        current_z = self._get_current_coordinate('Z')
+        print(f"AutoCapture starting at X:{current_x:.3f} Y:{current_y:.3f} Z:{current_z:.3f}")
+
+        if self.mode == "Focus Stack":
+            self._run_focus_stack(current_x, current_y, current_z)
+        elif self.mode == "XY Pattern":
+            self._run_xy_pattern(current_x, current_y, current_z)
+        elif self.mode == "Combined":
+            self._run_combined(current_x, current_y, current_z)
+
+        # Restart live view.
+        self.hardware.start_camera()
+        self.hardware.auto_capture_in_progress = False
+        self.finished_capture.emit()
+
+    def _get_current_coordinate(self, axis):
+        device = self.hardware.motion_controller.devices.get(axis, None)
+        if device is not None:
+            try:
+                return float(str(device.Position))
+            except Exception as e:
+                print(f"Error reading {axis} position: {e}")
+                return 0.0
+        return 0.0
+
+    def _run_focus_stack(self, x, y, z):
+        if self.num_stack <= 1:
+            z_positions = [z]
+        else:
+            z_positions = [z - self.z_stack_height/2 + i*(self.z_stack_height/(self.num_stack-1))
+                           for i in range(self.num_stack)]
+        total = len(z_positions)
+        completed = 0
+        per_capture = self.time_estimates["Focus Stack"]
+        for z_target in z_positions:
+            print(f"Moving Z to {z_target:.3f} for focus stack")
+            self.hardware.move_to_absolute(z=z_target)
+            time.sleep(0.5)
+            filename = f"focusstack_X{x:.3f}_Y{y:.3f}_Z{z_target:.3f}.png"
+            self.hardware.capture_image(filename=filename)
+            completed += 1
+            remaining = (total - completed) * per_capture
+            self.progress_update.emit(completed, total, remaining)
+
+    def _run_xy_pattern(self, x, y, z):
+        fov_x = self.hardware.fov_x
+        fov_y = self.hardware.fov_y
+        step_x = fov_x * (1 - self.overlap/100.0)
+        step_y = fov_y * (1 - self.overlap/100.0)
+        half_range_x = self.pattern_size_x / 2.0
+        half_range_y = self.pattern_size_y / 2.0
+        start_x = x - half_range_x
+        end_x = x + half_range_x
+        start_y = y - half_range_y
+        end_y = y + half_range_y
+        positions_x = []
+        pos = start_x
+        while pos <= end_x:
+            positions_x.append(pos)
+            pos += step_x
+        positions_y = []
+        pos = start_y
+        while pos <= end_y:
+            positions_y.append(pos)
+            pos += step_y
+
+        total = len(positions_x) * len(positions_y)
+        completed = 0
+        per_capture = self.time_estimates["XY Pattern"]
+        # Keep Z at the current (base) level.
+        for j, y_target in enumerate(positions_y):
+            xs = positions_x if j % 2 == 0 else list(reversed(positions_x))
+            for x_target in xs:
+                print(f"Moving XY to X:{x_target:.3f} Y:{y_target:.3f}")
+                self.hardware.move_to_absolute(x=x_target, y=y_target)
+                time.sleep(0.5)
+                filename = f"xy_X{x_target:.3f}_Y{y_target:.3f}_Z{z:.3f}.png"
+                self.hardware.capture_image(filename=filename)
+                completed += 1
+                remaining = (total - completed) * per_capture
+                self.progress_update.emit(completed, total, remaining)
+
+    def _run_combined(self, x, y, z):
+        fov_x = self.hardware.fov_x
+        fov_y = self.hardware.fov_y
+        step_x = fov_x * (1 - self.overlap/100.0)
+        step_y = fov_y * (1 - self.overlap/100.0)
+        half_range_x = self.pattern_size_x / 2.0
+        half_range_y = self.pattern_size_y / 2.0
+        start_x = x - half_range_x
+        end_x = x + half_range_x
+        start_y = y - half_range_y
+        end_y = y + half_range_y
+        positions_x = []
+        pos = start_x
+        while pos <= end_x:
+            positions_x.append(pos)
+            pos += step_x
+        positions_y = []
+        pos = start_y
+        while pos <= end_y:
+            positions_y.append(pos)
+            pos += step_y
+
+        if self.num_stack <= 1:
+            z_positions = [z]
+        else:
+            z_positions = [z - self.z_stack_height/2 + i*(self.z_stack_height/(self.num_stack-1))
+                           for i in range(self.num_stack)]
+        total = len(positions_x) * len(positions_y) * len(z_positions)
+        completed = 0
+        per_capture = self.time_estimates["Combined"]
+        for j, y_target in enumerate(positions_y):
+            xs = positions_x if j % 2 == 0 else list(reversed(positions_x))
+            for x_target in xs:
+                print(f"Moving XY to X:{x_target:.3f} Y:{y_target:.3f} for combined mode")
+                self.hardware.move_to_absolute(x=x_target, y=y_target)
+                time.sleep(0.5)
+                for z_target in z_positions:
+                    self.hardware.move_to_absolute(z=z_target)
+                    time.sleep(0.5)
+                    filename = f"combined_X{x_target:.3f}_Y{y_target:.3f}_Z{z_target:.3f}.png"
+                    self.hardware.capture_image(filename=filename)
+                    completed += 1
+                    remaining = (total - completed) * per_capture
+                    self.progress_update.emit(completed, total, remaining)
+                self.hardware.move_to_absolute(z=z)
+                time.sleep(0.5)
+
+
+###############################################################################
+# CameraWorker: Continuously grabs frames from the camera in a separate thread.
 ###############################################################################
 class CameraWorker(QThread):
-    """
-    Continuously grabs frames from the Thorlabs camera in a separate thread.
-    Emits new_frame whenever a frame arrives.
-    """
     new_frame = pyqtSignal(np.ndarray)
-    def __init__(self, camera, parent=None):
+
+    def __init__(self, camera, hardware, parent=None):
         super().__init__(parent)
         self.camera = camera
+        self.hardware = hardware  # for auto_capture_in_progress flag
         self.running = True
+
     def run(self):
         while self.running:
+            if self.hardware.auto_capture_in_progress:
+                time.sleep(0.1)
+                continue
             frame_list = self.camera.grab(1)
             if frame_list:
                 frame = np.array(frame_list[0])
-                # Convert the 16-bit image to 8-bit by dividing by 256.
-                display_frame = (frame / 256).clip(0, 255).astype(np.uint8)
+                min_val = frame.min()
+                max_val = frame.max()
+                scaled = (frame - min_val) / (max_val - min_val + 1e-6) * 255
+                display_frame = scaled.astype(np.uint8)
                 self.new_frame.emit(display_frame)
+
     def stop(self):
         self.running = False
         self.wait()
 
 
 ###############################################################################
-# MicroscopeHardware: Combines LED, Camera, and Motion
+# MicroscopeHardware: Combines LED, Camera, and Motion; includes auto-capture helpers.
 ###############################################################################
 class MicroscopeHardware:
-    """
-    Combines:
-      - Thorlabs camera (via pylablib)
-      - Thorlabs upSeries LED driver (via TLUP_64.dll)
-      - A MotionController instance for X, Y, Z stage
-    """
     def __init__(self):
         self.upHandle = None
         self.led_lib = None
         self.camera = None
         self.last_frame = None
         self.motion_controller = MotionController()
+        self.move_workers = []
+        self.fov_x = 12.0  # mm
+        self.fov_y = 10.0  # mm
+        self.max_slide_x = 50.0  # mm
+        self.max_slide_y = 50.0  # mm
+        self.auto_capture_in_progress = False
+        self.auto_capture_folder = None
         self._init_led_hardware()
         self._init_camera_hardware()
 
     def _init_camera_hardware(self):
-        pll.par["devices/dlls/thorlabs_tlcam"] = "path/to/dlls"  # Update as needed
+        pll.par["devices/dlls/thorlabs_tlcam"] = "path/to/dlls"
         cameras = Thorlabs.list_cameras_tlcam()
         if not cameras:
             print("No Thorlabs cameras found.")
             return
         self.camera = Thorlabs.ThorlabsTLCamera(serial=cameras[0])
         print(f"Connected to camera: {cameras[0]}")
-        default_exposure = 0.1  # ms (adjust as needed)
+        default_exposure = 0.1  # ms
         self.camera.set_exposure(default_exposure)
         print(f"Camera exposure set to {default_exposure} ms")
 
@@ -222,7 +408,6 @@ class MicroscopeHardware:
                   ", wavelength [nm]:", LEDWavelength.value)
             print("Max LED current [A]:", LEDCurrentLimit.value,
                   ", max forward voltage [V]:", LEDForwardVoltage.value)
-            # Set the current setpoint to 10% of the maximum current.
             currentSetpoint = c_double(0.1 * LEDCurrentLimit.value)
             self.led_lib.TLUP_setLedCurrentSetpoint(self.upHandle, currentSetpoint)
             time.sleep(1)
@@ -233,9 +418,6 @@ class MicroscopeHardware:
             self.led_lib.TLUP_setLedCurrentSetpoint(self.upHandle, currentSetpoint)
         print("LED init complete.\n")
 
-    # -------------------------
-    # Camera methods
-    # -------------------------
     def start_camera(self):
         if self.camera:
             self.camera.start_acquisition()
@@ -259,19 +441,26 @@ class MicroscopeHardware:
         if self.camera:
             self.camera.set_exposure(float(exposure_ms))
             print(f"Camera exposure set to {exposure_ms} ms")
-    # -------------------------
-    # Motion methods (absolute moves for all axes)
-    # -------------------------
     def move_stage(self, x=None, y=None, z=None):
         if x is not None:
-            self._move_axis_absolute("X", x)
+            worker = StageMoveWorker(self, "X", x)
+            worker.finished_move.connect(lambda w=worker: self._cleanup_worker(w))
+            self.move_workers.append(worker)
+            worker.start()
         if y is not None:
-            self._move_axis_absolute("Y", y)
+            worker = StageMoveWorker(self, "Y", y)
+            worker.finished_move.connect(lambda w=worker: self._cleanup_worker(w))
+            self.move_workers.append(worker)
+            worker.start()
         if z is not None:
-            self._move_axis_absolute("Z", z)
-
+            worker = StageMoveWorker(self, "Z", z)
+            worker.finished_move.connect(lambda w=worker: self._cleanup_worker(w))
+            self.move_workers.append(worker)
+            worker.start()
+    def _cleanup_worker(self, worker):
+        if worker in self.move_workers:
+            self.move_workers.remove(worker)
     def _move_axis_absolute(self, axis, step_mm):
-        """Reads the current position, adds the step (in mm), and calls MoveTo."""
         if axis not in self.motion_controller.devices:
             print(f"[{axis}] Axis not initialized.")
             return
@@ -289,10 +478,25 @@ class MicroscopeHardware:
             print(f"[{axis}] MoveTo command failed: {e}")
         time.sleep(0.1)
         print(f"[{axis}] Move done. Current pos: {device.Position}")
-
-    # -------------------------
-    # LED methods
-    # -------------------------
+    def move_to_absolute(self, x=None, y=None, z=None):
+        if x is not None:
+            device = self.motion_controller.devices.get("X")
+            if device is not None:
+                current_x = float(str(device.Position))
+                delta = x - current_x
+                self._move_axis_absolute("X", delta)
+        if y is not None:
+            device = self.motion_controller.devices.get("Y")
+            if device is not None:
+                current_y = float(str(device.Position))
+                delta = y - current_y
+                self._move_axis_absolute("Y", delta)
+        if z is not None:
+            device = self.motion_controller.devices.get("Z")
+            if device is not None:
+                current_z = float(str(device.Position))
+                delta = z - current_z
+                self._move_axis_absolute("Z", delta)
     def turn_on_led(self):
         if self.upHandle and self.led_lib:
             self.led_lib.TLUP_switchLedOutput(self.upHandle, 1)
@@ -302,43 +506,46 @@ class MicroscopeHardware:
             self.led_lib.TLUP_switchLedOutput(self.upHandle, 0)
             print("[LED] Turned off.")
     def set_uv_led_intensity(self, intensity_percent):
-        # Placeholder for UV LED control; to be implemented later.
         print("[UV LED] (Not implemented)")
     def set_white_led_intensity(self, intensity_percent):
         if self.led_lib and self.upHandle:
-            # Use the generic LED current setpoint function (as in the working code)
             current = (intensity_percent / 100.0) * self.led_max_current
             self.led_lib.TLUP_setLedCurrentSetpoint(self.upHandle, c_double(current))
             print(f"[White LED] Intensity set to {intensity_percent}% (current = {current} A)")
-    # -------------------------
-    # Capture methods
-    # -------------------------
-    def capture_and_save_image(self):
+    def capture_image(self, filename="captured_image.png"):
         if not self.camera:
             print("No camera available for auto capture!")
             return
         self.turn_on_led()
-        time.sleep(0.5)  # let LED stabilize
+        time.sleep(0.5)
         frame_list = self.camera.grab(1)
         if frame_list:
             frame = np.array(frame_list[0])
-            self._save_frame_to_downloads(frame, "captured_image.png")
+            self._save_frame_to_downloads(frame, filename)
         else:
             print("[CAPTURE] No frame received from camera!")
         self.turn_off_led()
+    def capture_and_save_image(self):
+        self.capture_image(filename="captured_image.png")
     def save_last_frame(self):
         if self.last_frame is None:
             print("[SAVE] No current frame available to save!")
             return
         self._save_frame_to_downloads(self.last_frame, "current_frame.png")
     def _save_frame_to_downloads(self, frame, filename):
-        if frame.max() > 0:
-            frame_uint8 = (frame / frame.max() * 255).astype('uint8')
+        # Save in full 16-bit depth.
+        if frame.dtype != np.uint16:
+            # Scale to full 16-bit (0-65535)
+            if frame.max() > 0:
+                frame_uint16 = (frame.astype(np.float32) / frame.max() * 65535).astype(np.uint16)
+            else:
+                frame_uint16 = frame.astype(np.uint16)
         else:
-            frame_uint8 = frame.astype('uint8')
-        downloads = os.path.join(os.path.expanduser("~"), "Downloads")
-        image_path = os.path.join(downloads, filename)
-        cv2.imwrite(image_path, frame_uint8)
+            frame_uint16 = frame
+        # Use auto_capture_folder if defined.
+        folder = self.auto_capture_folder if self.auto_capture_folder is not None else os.path.join(os.path.expanduser("~"), "Downloads")
+        image_path = os.path.join(folder, filename)
+        cv2.imwrite(image_path, frame_uint16)
         print(f"[SAVE] Saved image to {image_path}")
 
 
@@ -373,32 +580,28 @@ class ControlPanelWidget(QWidget):
         layout = QVBoxLayout()
         self.setLayout(layout)
 
-        # 1) Stage Controls Group (using QDoubleSpinBox for mm input)
+        # Stage Controls Group
         stage_group = QGroupBox("Stage Controls")
         stage_layout = QGridLayout()
         stage_group.setLayout(stage_layout)
-
         self.step_spin = QDoubleSpinBox()
         self.step_spin.setDecimals(3)
-        self.step_spin.setRange(0.001, 50.0)  # Range in mm
+        self.step_spin.setRange(0.001, 50.0)
         self.step_spin.setSingleStep(0.001)
-        self.step_spin.setValue(0.010)  # default 0.01 mm
+        self.step_spin.setValue(0.010)
         self.step_spin.setSuffix(" mm")
-
         self.x_pos_button = QPushButton("X +")
         self.x_neg_button = QPushButton("X -")
         self.y_pos_button = QPushButton("Y +")
         self.y_neg_button = QPushButton("Y -")
         self.z_pos_button = QPushButton("Z +")
         self.z_neg_button = QPushButton("Z -")
-
         self.x_pos_button.clicked.connect(lambda: self.hardware.move_stage(x=self.step_spin.value()))
         self.x_neg_button.clicked.connect(lambda: self.hardware.move_stage(x=-self.step_spin.value()))
         self.y_pos_button.clicked.connect(lambda: self.hardware.move_stage(y=self.step_spin.value()))
         self.y_neg_button.clicked.connect(lambda: self.hardware.move_stage(y=-self.step_spin.value()))
         self.z_pos_button.clicked.connect(lambda: self.hardware.move_stage(z=self.step_spin.value()))
         self.z_neg_button.clicked.connect(lambda: self.hardware.move_stage(z=-self.step_spin.value()))
-
         stage_layout.addWidget(QLabel("Step size:"), 0, 0)
         stage_layout.addWidget(self.step_spin, 0, 1)
         stage_layout.addWidget(self.x_pos_button, 1, 0)
@@ -407,15 +610,19 @@ class ControlPanelWidget(QWidget):
         stage_layout.addWidget(self.y_neg_button, 2, 1)
         stage_layout.addWidget(self.z_pos_button, 3, 0)
         stage_layout.addWidget(self.z_neg_button, 3, 1)
-
         layout.addWidget(stage_group)
 
-        # 2) LED Controls Group with brightness sliders for UV and White LEDs
+        # Stage Coordinates Display
+        self.coordinates_label = QLabel("Stage Coordinates: X: 0.000 mm, Y: 0.000 mm, Z: 0.000 mm")
+        layout.addWidget(self.coordinates_label)
+        self.coordinates_timer = QTimer(self)
+        self.coordinates_timer.timeout.connect(self.update_coordinates)
+        self.coordinates_timer.start(500)
+
+        # LED Controls Group
         led_group = QGroupBox("LED Controls")
         led_layout = QGridLayout()
         led_group.setLayout(led_layout)
-
-        # UV LED Controls (placeholder)
         led_layout.addWidget(QLabel("UV LED:"), 0, 0)
         self.uv_led_checkbox = QCheckBox("Enable")
         led_layout.addWidget(self.uv_led_checkbox, 0, 1)
@@ -429,11 +636,8 @@ class ControlPanelWidget(QWidget):
         self.uv_intensity_edit.setFixedWidth(60)
         self.uv_intensity_edit.editingFinished.connect(self.update_uv_slider_from_intensity)
         led_layout.addWidget(self.uv_intensity_edit, 1, 2)
-
-        # White LED Controls
         led_layout.addWidget(QLabel("White LED:"), 2, 0)
         self.white_led_checkbox = QCheckBox("Enable")
-        # Modify the white LED toggle so that it immediately sets brightness and turns the LED on/off.
         self.white_led_checkbox.stateChanged.connect(self.white_led_toggled)
         led_layout.addWidget(self.white_led_checkbox, 2, 1)
         led_layout.addWidget(QLabel("White Intensity (%):"), 3, 0)
@@ -446,17 +650,16 @@ class ControlPanelWidget(QWidget):
         self.white_intensity_edit.setFixedWidth(60)
         self.white_intensity_edit.editingFinished.connect(self.update_white_slider_from_intensity)
         led_layout.addWidget(self.white_intensity_edit, 3, 2)
-
         layout.addWidget(led_group)
 
-        # 3) Camera Controls Group
+        # Camera Controls Group
         camera_group = QGroupBox("Camera Controls")
         camera_layout = QHBoxLayout()
         camera_group.setLayout(camera_layout)
         camera_layout.addWidget(QLabel("Exposure (ms):"))
         self.exposure_slider = QSlider(Qt.Horizontal)
-        self.exposure_slider.setRange(1, 100)  # Represents 0.01 to 1.00 ms
-        self.exposure_slider.setValue(10)      # default = 0.10 ms
+        self.exposure_slider.setRange(1, 100)
+        self.exposure_slider.setValue(10)
         self.exposure_slider.valueChanged.connect(self.update_exposure_from_slider)
         camera_layout.addWidget(self.exposure_slider)
         self.exposure_edit = QLineEdit("0.10")
@@ -465,23 +668,81 @@ class ControlPanelWidget(QWidget):
         camera_layout.addWidget(self.exposure_edit)
         layout.addWidget(camera_group)
 
-        # 4) Capture/Save Buttons
+        # Automatic Capture Options Group
+        auto_group = QGroupBox("Automatic Capture Options")
+        auto_layout = QGridLayout()
+        auto_group.setLayout(auto_layout)
+        auto_layout.addWidget(QLabel("Mode:"), 0, 0)
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItems(["Focus Stack", "XY Pattern", "Combined"])
+        auto_layout.addWidget(self.mode_combo, 0, 1)
+        auto_layout.addWidget(QLabel("Overlap (%):"), 1, 0)
+        self.overlap_spin = QDoubleSpinBox()
+        self.overlap_spin.setRange(0, 100)
+        self.overlap_spin.setDecimals(1)
+        self.overlap_spin.setValue(20.0)
+        auto_layout.addWidget(self.overlap_spin, 1, 1)
+        auto_layout.addWidget(QLabel("# Images (Stack):"), 2, 0)
+        self.stack_count_spin = QSpinBox()
+        self.stack_count_spin.setRange(1, 100)
+        self.stack_count_spin.setValue(5)
+        auto_layout.addWidget(self.stack_count_spin, 2, 1)
+        auto_layout.addWidget(QLabel("Pattern Size X (mm):"), 3, 0)
+        self.pattern_x_spin = QDoubleSpinBox()
+        self.pattern_x_spin.setRange(0.1, self.hardware.max_slide_x)
+        self.pattern_x_spin.setValue(10.0)
+        auto_layout.addWidget(self.pattern_x_spin, 3, 1)
+        auto_layout.addWidget(QLabel("Pattern Size Y (mm):"), 4, 0)
+        self.pattern_y_spin = QDoubleSpinBox()
+        self.pattern_y_spin.setRange(0.1, self.hardware.max_slide_y)
+        self.pattern_y_spin.setValue(10.0)
+        auto_layout.addWidget(self.pattern_y_spin, 4, 1)
+        auto_layout.addWidget(QLabel("Z Stack Height (mm):"), 5, 0)
+        self.z_stack_height_spin = QDoubleSpinBox()
+        self.z_stack_height_spin.setRange(0.0, 20.0)
+        self.z_stack_height_spin.setDecimals(3)
+        self.z_stack_height_spin.setValue(1.0)
+        auto_layout.addWidget(self.z_stack_height_spin, 5, 1)
+        layout.addWidget(auto_group)
+
+        # Progress Bar and Estimated Time Display
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setMinimum(0)
+        self.progress_bar.setValue(0)
+        self.progress_bar.hide()
+        layout.addWidget(self.progress_bar)
+        self.progress_label = QLabel("")
+        self.progress_label.hide()
+        layout.addWidget(self.progress_label)
+
+        # Capture/Save Buttons
         self.capture_button = QPushButton("Auto Capture")
         self.capture_button.clicked.connect(self.auto_capture_clicked)
         layout.addWidget(self.capture_button)
         self.save_button = QPushButton("Save Current Photo")
         self.save_button.clicked.connect(self.save_current_photo_clicked)
         layout.addWidget(self.save_button)
-
         layout.addStretch()
 
-    # -----------------------------
-    # White LED toggle event handler
-    # -----------------------------
+    def update_coordinates(self):
+        mc = self.hardware.motion_controller
+        coords = {}
+        for axis in ['X', 'Y', 'Z']:
+            device = mc.devices.get(axis, None)
+            if device is not None:
+                try:
+                    coords[axis] = float(str(device.Position))
+                except Exception as e:
+                    coords[axis] = 0.0
+            else:
+                coords[axis] = 0.0
+        self.coordinates_label.setText(
+            f"Stage Coordinates: X: {coords['X']:.3f} mm, Y: {coords['Y']:.3f} mm, Z: {coords['Z']:.3f} mm"
+        )
+
     @pyqtSlot(int)
     def white_led_toggled(self, state):
         if state == Qt.Checked:
-            # When enabling, set the white LED intensity first then turn on the LED.
             try:
                 intensity = int(self.white_intensity_edit.text())
             except ValueError:
@@ -492,12 +753,8 @@ class ControlPanelWidget(QWidget):
         else:
             self.hardware.turn_off_led()
 
-    # -----------------------------
-    # LED intensity update methods for UV LED (placeholders)
-    # -----------------------------
     def update_uv_intensity_from_slider(self, slider_value):
         self.uv_intensity_edit.setText(str(slider_value))
-        # Placeholder for UV LED control; not implemented yet.
     def update_uv_slider_from_intensity(self):
         try:
             val = int(self.uv_intensity_edit.text())
@@ -507,11 +764,6 @@ class ControlPanelWidget(QWidget):
             return
         val = max(0, min(val, 100))
         self.uv_intensity_slider.setValue(val)
-        # Placeholder for UV LED control; not implemented yet.
-
-    # -----------------------------
-    # LED intensity update methods for White LED
-    # -----------------------------
     def update_white_intensity_from_slider(self, slider_value):
         self.white_intensity_edit.setText(str(slider_value))
         if self.white_led_checkbox.isChecked():
@@ -527,10 +779,6 @@ class ControlPanelWidget(QWidget):
         self.white_intensity_slider.setValue(val)
         if self.white_led_checkbox.isChecked():
             self.hardware.set_white_led_intensity(val)
-
-    # -----------------------------
-    # Camera exposure methods
-    # -----------------------------
     def update_exposure_from_slider(self, slider_value):
         exposure_ms = slider_value / 100.0
         self.exposure_edit.setText(f"{exposure_ms:.2f}")
@@ -547,17 +795,40 @@ class ControlPanelWidget(QWidget):
         self.exposure_slider.setValue(slider_val)
         self.hardware.set_exposure(entered_value)
 
-    # -----------------------------
-    # Capture/Save event handlers
-    # -----------------------------
+    def update_progress(self, completed, total, remaining):
+        self.progress_bar.setMaximum(total)
+        self.progress_bar.setValue(completed)
+        percent = (completed / total) * 100
+        self.progress_label.setText(f"Progress: {percent:.1f}% | Estimated time remaining: {remaining:.0f} sec")
+
     def auto_capture_clicked(self):
-        self.hardware.capture_and_save_image()
+        mode = self.mode_combo.currentText()
+        overlap = self.overlap_spin.value()
+        num_stack = self.stack_count_spin.value()
+        pattern_x = self.pattern_x_spin.value()
+        pattern_y = self.pattern_y_spin.value()
+        z_stack_height = self.z_stack_height_spin.value()
+        self.progress_bar.show()
+        self.progress_label.show()
+        self.progress_bar.setValue(0)
+        self.progress_label.setText("Progress: 0% | Estimated time remaining: --")
+        self.auto_capture_worker = AutoCaptureWorker(self.hardware, mode, overlap, num_stack,
+                                                     pattern_x, pattern_y, z_stack_height)
+        self.auto_capture_worker.progress_update.connect(self.update_progress)
+        self.auto_capture_worker.finished_capture.connect(self.auto_capture_finished)
+        self.auto_capture_worker.start()
+
+    def auto_capture_finished(self):
+        print("Auto Capture completed.")
+        self.progress_bar.hide()
+        self.progress_label.hide()
+
     def save_current_photo_clicked(self):
         self.hardware.save_last_frame()
 
 
 ###############################################################################
-# Main Window
+# MainWindow
 ###############################################################################
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -574,15 +845,17 @@ class MainWindow(QMainWindow):
         self.control_panel = ControlPanelWidget(self.hardware)
         main_layout.addWidget(self.control_panel, stretch=1)
         if self.hardware.camera:
-            self.camera_thread = CameraWorker(self.hardware.camera)
+            self.camera_thread = CameraWorker(self.hardware.camera, self.hardware)
             self.camera_thread.new_frame.connect(self.on_new_frame)
             self.camera_thread.start()
         else:
             self.camera_thread = None
+
     @pyqtSlot(np.ndarray)
     def on_new_frame(self, frame):
         self.hardware.last_frame = frame
         self.camera_display.update_frame(frame)
+
     def closeEvent(self, event):
         if self.camera_thread and self.camera_thread.isRunning():
             self.camera_thread.stop()
