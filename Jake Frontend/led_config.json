@@ -1,0 +1,16 @@
+{
+  "White LED": {
+    "port": "COM4",
+    "resource": "ASRL4::INSTR",
+    "led_model": "\"MWUVL1\"",
+    "led_serial": "\"M00920922\"",
+    "led_wavelength": -4000.0
+  },
+  "UV LED": {
+    "port": "COM5",
+    "resource": "ASRL5::INSTR",
+    "led_model": "\"M275L4\"",
+    "led_serial": "\"M00815338\"",
+    "led_wavelength": 275.0
+  }
+}
