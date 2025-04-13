@@ -30,31 +30,42 @@ from pylablib.devices import Thorlabs
 HISTOGRAM_WIDTH = 256
 HISTOGRAM_HEIGHT = 100
 
-# Import CUDA helper
-try:
-    from cuda_helper import CUDA_AVAILABLE, normalize_frame_gpu, normalize_frame_cpu
-    print(f"CUDA acceleration: {'Available' if CUDA_AVAILABLE else 'Not available'}")
-except ImportError:
-    print("CUDA helper module not found, using CPU processing")
-    CUDA_AVAILABLE = False
+# Configure ThorLabs SDK paths
+def configure_thorlabs_paths():
+    """Configure paths for ThorLabs SDK DLLs"""
+    is_64bits = sys.maxsize > 2**32
+    relative_path_to_dlls = os.path.join('Python Toolkit', 'dlls')
     
-    def normalize_frame_cpu(frame):
-        """Simple min-max normalization"""
-        if frame is None or frame.size == 0:
-            return np.zeros((10, 10), dtype=np.uint8)
-            
-        min_val = frame.min()
-        max_val = frame.max()
-        
-        if max_val > min_val:
-            scaled = (frame - min_val) / (max_val - min_val) * 255.0
-            return scaled.astype(np.uint8)
-        else:
-            return np.full_like(frame, 127, dtype=np.uint8)
-                
-    # Stub function that calls the CPU version
-    def normalize_frame_gpu(frame):
-        return normalize_frame_cpu(frame)
+    if is_64bits:
+        relative_path_to_dlls = os.path.join(relative_path_to_dlls, '64_lib')
+    else:
+        relative_path_to_dlls = os.path.join(relative_path_to_dlls, '32_lib')
+    
+    absolute_path_to_dlls = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), relative_path_to_dlls))
+    
+    if os.path.exists(absolute_path_to_dlls):
+        os.environ['PATH'] = absolute_path_to_dlls + os.pathsep + os.environ['PATH']
+        try:
+            # Python 3.8 introduces a new method to specify dll directory
+            os.add_dll_directory(absolute_path_to_dlls)
+        except AttributeError:
+            pass
+        print(f"Added ThorLabs DLL path: {absolute_path_to_dlls}")
+    else:
+        print(f"WARNING: ThorLabs DLL path does not exist: {absolute_path_to_dlls}")
+
+# Configure SDK paths before importing
+configure_thorlabs_paths()
+
+# Try to import ThorLabs SDK components
+try:
+    from thorlabs_tsi_sdk.tl_camera import TLCameraSDK
+    from thorlabs_tsi_sdk.tl_camera_enums import SENSOR_TYPE
+    from thorlabs_tsi_sdk.tl_mono_to_color_processor import MonoToColorProcessorSDK
+    print("Successfully imported ThorLabs SDK for color processing")
+except ImportError as e:
+    print(f"Warning: ThorLabs SDK import error: {e}")
+    print("Color processing functionality will be limited")
 
 # ------------------------------
 # .NET / Kinesis motion imports
@@ -179,35 +190,6 @@ class MotionController:
                 device.Disconnect()
         SimulationManager.Instance.UninitializeSimulations()
 
-    def zero_position(self):
-        """Set the current stage position as zero for all axes"""
-        try:
-            # For each axis, set the current position as the new origin
-            for axis, device in self.devices.items():
-                if device is not None:
-                    # Get the current position
-                    current_pos = float(str(device.Position))
-                    
-                    # Create a new position object with the offset to make the current position zero
-                    offset = -current_pos
-                    
-                    # Set the home offset to the current position
-                    # This effectively defines the current position as the new origin
-                    device.SetHomingParams(device.HomingParams, True)
-                    
-                    # Alternatively, use the position setter if available
-                    try:
-                        # Some controllers support direct position setting
-                        device.SetPosition(Decimal(0))
-                    except:
-                        # If position setting fails, try to apply the offset by moving
-                        pass
-                        
-            return True
-        except Exception as e:
-            print(f"Error zeroing stage position: {e}")
-            return False
-
     def _get_coordinate(self, axis):
         """Get the current position of the specified axis in mm"""
         if axis not in self.devices:
@@ -269,9 +251,15 @@ class AutoCaptureWorker(QThread):
         folder_name = os.path.join(downloads, f"AutoCapture_{timestamp}")
         os.makedirs(folder_name, exist_ok=True)
         self.hardware.auto_capture_folder = folder_name
+        self.hardware.current_capture_folder = folder_name
 
+        # Set auto capture flag
         self.hardware.auto_capture_in_progress = True
+        
+        # Pause briefly to ensure we have a stable connection
+        time.sleep(0.2)
 
+        # Get current position
         current_x = self._get_current_coordinate('X')
         current_y = self._get_current_coordinate('Y')
         current_z = self._get_current_coordinate('Z')
@@ -285,8 +273,7 @@ class AutoCaptureWorker(QThread):
 
         # Ensure LED is turned off after capture
         self.hardware.turn_off_led()
-        
-        self.hardware.start_camera()
+            
         self.hardware.auto_capture_in_progress = False
         self.finished_capture.emit()
 
@@ -615,7 +602,7 @@ class PreviewFieldWorker(QThread):
 class CameraWorker(QThread):
     new_frame = pyqtSignal(np.ndarray)
     error_occurred = pyqtSignal(str)
-
+    
     def __init__(self, camera, hardware, parent=None):
         super().__init__(parent)
         self.camera = camera
@@ -628,6 +615,8 @@ class CameraWorker(QThread):
         self.autoexposure_interval = 0.5  # Only adjust exposure every 0.5 seconds
         self.consecutive_errors = 0
         self.max_consecutive_errors = 5
+        # Check if we're using ThorLabs SDK directly or pylablib
+        self.using_sdk_directly = hasattr(self.hardware, '_camera_sdk') and self.hardware._camera_sdk is not None
     
     def run(self):
         while self.running:
@@ -640,10 +629,18 @@ class CameraWorker(QThread):
                     time.sleep(self.min_frame_interval - time_since_last_frame)
                     continue
                 
-                # Try to grab a frame without timeout parameter
-                with QMutexLocker(self.hardware.camera_lock):
+                # Acquire frame based on camera type
+                if self.using_sdk_directly:
+                    # Using ThorLabs SDK directly
                     try:
-                        frame_list = self.camera.grab(1)
+                        frame = self.camera.get_pending_frame_or_null()
+                        if frame is None:
+                            time.sleep(0.001)  # Avoid CPU spinning
+                            continue
+                            
+                        # Get raw frame data
+                        np_frame = frame.image_buffer
+                        
                     except Exception as e:
                         self.consecutive_errors += 1
                         if self.consecutive_errors >= self.max_consecutive_errors:
@@ -652,18 +649,34 @@ class CameraWorker(QThread):
                             self.consecutive_errors = 0
                         continue
                 
-                if not frame_list:
-                    time.sleep(0.01)  # Short sleep to prevent CPU spinning
-                    continue
+                else:
+                    # Using pylablib camera
+                    with QMutexLocker(self.hardware.camera_lock):
+                        try:
+                            frame_list = self.camera.grab(1)
+                        except Exception as e:
+                            self.consecutive_errors += 1
+                            if self.consecutive_errors >= self.max_consecutive_errors:
+                                self.error_occurred.emit(f"Multiple camera errors: {str(e)}")
+                                # Reset counter but continue trying
+                                self.consecutive_errors = 0
+                            continue
+                    
+                    if not frame_list:
+                        time.sleep(0.01)  # Short sleep to prevent CPU spinning
+                        continue
+                    
+                    # Get raw frame data
+                    np_frame = np.array(frame_list[0])
                 
                 # Reset error counter on successful frame
                 self.consecutive_errors = 0
                 
-                # Get raw frame data
-                frame = np.array(frame_list[0])
-                
                 # Process the frame through the hardware
-                processed_frame = self.hardware.process_frame(frame)
+                processed_frame = self.hardware.process_frame(np_frame)
+                
+                # Update the last frame time
+                self.hardware.last_frame_time = time.time()
                 
                 # Handle auto-exposure if enabled and it's time to check
                 if self.hardware.autoexposure_enabled:
@@ -711,6 +724,7 @@ class MicroscopeHardware:
         self.led_lib = None
         self.camera = None
         self.last_frame = None
+        self.last_frame_time = 0  # Track when frames were captured
         
         # Initialize motion controller first to give it time to home axes
         self.motion_controller = MotionController()
@@ -726,7 +740,7 @@ class MicroscopeHardware:
             "10X": {
                 "fov_x": 4.8,  # Field of view in mm
                 "fov_y": 4.0,
-                "z_zero": 31.5,  # Z zero position in mm (absolute)
+                "z_zero": 8.6,  # Z zero position in mm (absolute)
             }
         }
         
@@ -1127,10 +1141,71 @@ class MicroscopeHardware:
             print("LED not initialized.")
 
     def _init_camera_hardware(self):
-        # Update the path to the actual ThorLabs SDK DLL location
-        pll.par["devices/dlls/thorlabs_tlcam"] = r"C:\Program Files\Thorlabs\Scientific Imaging\ThorCam\SDK"
-        
+        # Initialize color processing variables
+        self._mono_to_color_sdk = None
+        self._mono_to_color_processor = None
+        self._is_color = False
+        self._camera_sdk = None
+
         try:
+            # Try to initialize using direct ThorLabs SDK first
+            try:
+                self._camera_sdk = TLCameraSDK()
+                camera_list = self._camera_sdk.discover_available_cameras()
+                
+                if not camera_list:
+                    print("No cameras detected with ThorLabs SDK, falling back to pylablib")
+                    raise ImportError("No cameras found")
+                
+                # Open the first camera
+                self.camera = self._camera_sdk.open_camera(camera_list[0])
+                print(f"Connected to camera: {self.camera.name}")
+                
+                # Configure camera for performance
+                self.camera.frames_per_trigger_zero_for_unlimited = 0  # Continuous mode
+                self.camera.exposure_time_us = 100000  # Initial 100ms exposure
+                
+                # Get camera model information
+                self.camera_model = self.camera.name
+                self.bit_depth = self.camera.bit_depth
+                self.sensor_width = self.camera.image_width_pixels
+                self.sensor_height = self.camera.image_height_pixels
+                
+                # Set up color processing if necessary
+                if self.camera.camera_sensor_type == SENSOR_TYPE.BAYER:
+                    # Initialize color processing for Bayer pattern cameras
+                    self._mono_to_color_sdk = MonoToColorProcessorSDK()
+                    self._mono_to_color_processor = self._mono_to_color_sdk.create_mono_to_color_processor(
+                        SENSOR_TYPE.BAYER,
+                        self.camera.color_filter_array_phase,
+                        self.camera.get_color_correction_matrix(),
+                        self.camera.get_default_white_balance_matrix(),
+                        self.camera.bit_depth
+                    )
+                    self._is_color = True
+                    self.bayer_pattern = "BAYER"  # Generic label, actual pattern handled by SDK
+                    print(f"Camera is color (Bayer pattern), using ThorLabs color processing")
+                else:
+                    # Monochrome camera
+                    self._is_color = False
+                    self.bayer_pattern = None
+                    print(f"Camera is monochrome")
+                
+                # Arm the camera
+                self.camera.arm(2)
+                self.camera.issue_software_trigger()
+                
+                # Parameters for proper frame processing
+                self.max_pixel_value = 2**self.bit_depth - 1
+                print(f"Camera initialized: {self.camera_model}, {self.sensor_width}x{self.sensor_height}, {self.bit_depth}-bit")
+                return
+                
+            except (ImportError, AttributeError, NameError) as e:
+                print(f"Direct ThorLabs SDK initialization failed: {e}, falling back to pylablib")
+        
+            # Fall back to pylablib if direct SDK fails
+            pll.par["devices/dlls/thorlabs_tlcam"] = r"C:\Program Files\Thorlabs\Scientific Imaging\ThorCam\SDK"
+            
             cameras = Thorlabs.list_cameras_tlcam()
             if not cameras:
                 print("No Thorlabs cameras found.")
@@ -1139,7 +1214,7 @@ class MicroscopeHardware:
             
             # Connect to camera and get information
             self.camera = Thorlabs.ThorlabsTLCamera(serial=cameras[0])
-            print(f"Connected to camera: {cameras[0]}")
+            print(f"Connected to camera: {cameras[0]} (via pylablib)")
             
             # Check if camera is a CS505CU1 model (or similar)
             try:
@@ -1313,10 +1388,17 @@ class MicroscopeHardware:
         pass
 
     def start_camera(self):
+        """Start camera acquisition"""
         if self.camera:
             try:
-                self.camera.start_acquisition()
-                print("Camera acquisition started.")
+                # Check if using direct SDK or pylablib
+                if hasattr(self, '_camera_sdk') and self._camera_sdk is not None:
+                    # Direct SDK camera is already armed in _init_camera_hardware
+                    print("Camera acquisition started (ThorLabs SDK)")
+                else:
+                    # Pylablib camera
+                    self.camera.start_acquisition()
+                    print("Camera acquisition started (pylablib)")
                 return True
             except Exception as e:
                 print(f"ERROR starting camera acquisition: {e}")
@@ -1327,15 +1409,46 @@ class MicroscopeHardware:
             return False
 
     def stop_camera(self):
+        """Stop camera acquisition"""
         if self.camera:
-            self.camera.stop_acquisition()
-            print("Camera acquisition stopped.")
+            try:
+                # Check if using direct SDK or pylablib
+                if hasattr(self, '_camera_sdk') and self._camera_sdk is not None:
+                    # Direct SDK camera
+                    if hasattr(self.camera, 'disarm'):
+                        self.camera.disarm()
+                    print("Camera acquisition stopped (ThorLabs SDK)")
+                else:
+                    # Pylablib camera
+                    self.camera.stop_acquisition()
+                    print("Camera acquisition stopped (pylablib)")
+            except Exception as e:
+                print(f"ERROR stopping camera: {e}")
 
     def close_hardware(self):
+        """Close all hardware connections"""
         if self.camera:
-            self.camera.close()
-            print("Camera closed.")
-            self.camera = None
+            try:
+                # Check if using direct SDK or pylablib
+                if hasattr(self, '_camera_sdk') and self._camera_sdk is not None:
+                    # Direct SDK camera
+                    if hasattr(self.camera, 'disarm'):
+                        self.camera.disarm()
+                    self.camera.dispose()
+                    if self._mono_to_color_processor:
+                        self._mono_to_color_processor.dispose()
+                    if self._mono_to_color_sdk:
+                        self._mono_to_color_sdk.dispose()
+                    if self._camera_sdk:
+                        self._camera_sdk.dispose()
+                    print("ThorLabs SDK camera closed.")
+                else:
+                    # Pylablib camera
+                    self.camera.close()
+                    print("Pylablib camera closed.")
+                self.camera = None
+            except Exception as e:
+                print(f"ERROR closing camera: {e}")
             
         # Close any open LED controllers
         self.turn_off_led()
@@ -1353,10 +1466,22 @@ class MicroscopeHardware:
             self.motion_controller.disconnect_all()
 
     def set_exposure(self, exposure_sec):
+        """Set camera exposure time in seconds"""
         if self.camera:
-            self.current_exposure = float(exposure_sec)
-            self.camera.set_exposure(self.current_exposure)
-            print(f"Camera exposure set to {self.current_exposure} s")
+            try:
+                self.current_exposure = float(exposure_sec)
+                
+                # Check if using direct SDK or pylablib
+                if hasattr(self, '_camera_sdk') and self._camera_sdk is not None:
+                    # Direct SDK - convert to microseconds
+                    self.camera.exposure_time_us = int(self.current_exposure * 1000000)
+                else:
+                    # Pylablib camera
+                    self.camera.set_exposure(self.current_exposure)
+                    
+                print(f"Camera exposure set to {self.current_exposure} s")
+            except Exception as e:
+                print(f"ERROR setting exposure: {e}")
             
     def set_autoexposure(self, enabled):
         """Enable or disable autoexposure"""
@@ -1364,7 +1489,7 @@ class MicroscopeHardware:
         print(f"Autoexposure {'enabled' if enabled else 'disabled'}")
         
     def process_frame(self, frame):
-        """Process a frame from the camera for display using simple normalization"""
+        """Process a frame from the camera for display using ThorLabs SDK or fallback processing"""
         if frame is None or frame.size == 0:
             return np.zeros((100, 100, 3), dtype=np.uint8)  # Return empty frame
         
@@ -1372,20 +1497,51 @@ class MicroscopeHardware:
         self.last_frame = frame.copy()
         self.last_frame_time = time.time()
         
-        # Apply simple normalization - either GPU or CPU based on availability
         try:
-            if CUDA_AVAILABLE:
-                # Use GPU normalization for better performance
-                normalized = normalize_frame_gpu(frame)
+            # Check if we're using the direct ThorLabs SDK with color processor
+            if self._mono_to_color_processor is not None and self._is_color:
+                # For color camera with ThorLabs SDK
+                width = frame.shape[1]
+                height = frame.shape[0]
+                
+                # Use ThorLabs color processor to transform to 24-bit RGB
+                color_image_data = self._mono_to_color_processor.transform_to_24(
+                    frame,
+                    width,
+                    height
+                )
+                # Reshape to proper dimensions
+                color_image_data = color_image_data.reshape(height, width, 3)
+                return color_image_data
+            
+            elif self._camera_sdk is not None and not self._is_color:
+                # For monochrome camera with ThorLabs SDK - convert to 8-bit
+                scaled_image = frame >> (self.bit_depth - 8)
+                # Convert to RGB for display consistency
+                rgb_image = cv2.cvtColor(scaled_image.astype(np.uint8), cv2.COLOR_GRAY2RGB)
+                return rgb_image
+            
             else:
-                # Fall back to CPU normalization
-                normalized = normalize_frame_cpu(frame)
+                # Fallback for pylablib camera - simple min-max normalization
+                if frame.size == 0:
+                    return np.zeros((100, 100, 3), dtype=np.uint8)
                 
-            # Convert to RGB if needed
-            if len(normalized.shape) == 2:
-                normalized = cv2.cvtColor(normalized, cv2.COLOR_GRAY2RGB)
+                # Apply simple normalization
+                min_val = frame.min()
+                max_val = frame.max()
                 
-            return normalized
+                if max_val > min_val:
+                    # Scale to 0-255 range
+                    scaled = (frame - min_val) / (max_val - min_val) * 255.0
+                    normalized = scaled.astype(np.uint8)
+                else:
+                    normalized = np.full_like(frame, 127, dtype=np.uint8)
+                
+                # Convert to RGB if needed
+                if len(normalized.shape) == 2:
+                    normalized = cv2.cvtColor(normalized, cv2.COLOR_GRAY2RGB)
+                
+                return normalized
         
         except Exception as e:
             print(f"Error in frame processing: {e}")
@@ -1452,7 +1608,7 @@ class MicroscopeHardware:
             dynamic_range = 0
             
         return mean_brightness, dynamic_range, weighted_hist
-
+        
     def adjust_autoexposure(self):
         """Adjust camera exposure based on image brightness"""
         if not self.camera or self.last_frame is None or self.last_frame.size == 0:
@@ -1476,16 +1632,21 @@ class MicroscopeHardware:
         # Use exponential mapping for more natural control
         adjustment = np.exp(error/100.0) - 1
         
-        # Apply adjustment with limits
-        current_exposure = self.camera.get_exposure()
+        # Get current exposure based on camera type
+        if hasattr(self, '_camera_sdk') and self._camera_sdk is not None:
+            # Direct SDK - convert from microseconds to seconds
+            current_exposure = self.camera.exposure_time_us / 1000000.0
+        else:
+            # Pylablib camera
+            current_exposure = self.camera.get_exposure()
+            
         new_exposure = current_exposure * (1 + adjustment)
         new_exposure = max(self.autoexposure_min, min(self.autoexposure_max, new_exposure))  # Limit to range
         
         # Only adjust if change is significant (>5%)
         if abs(new_exposure - current_exposure) / current_exposure > 0.05:
-            self.camera.set_exposure(new_exposure)
-            self.current_exposure = new_exposure
-
+            self.set_exposure(new_exposure)
+            
     def move_stage(self, x=None, y=None, z=None):
         if x is not None:
             worker = StageMoveWorker(self, "X", x)
@@ -1524,6 +1685,7 @@ class MicroscopeHardware:
             print(f"[{axis}] MoveTo command failed: {e}")
 
     def move_to_absolute(self, x=None, y=None, z=None):
+        """Move axes to absolute positions in mm"""
         if x is not None:
             device = self.motion_controller.devices.get("X")
             if device is not None:
@@ -1542,187 +1704,6 @@ class MicroscopeHardware:
                 current_z = float(str(device.Position))
                 delta = z - current_z
                 self._move_axis_absolute("Z", delta)
-
-    def capture_image(self, filename="captured_image.png"):
-        if not self.camera:
-            print("No camera available for capture!")
-            return None
-        
-        # Turn on LED for capture
-        self.turn_on_led()
-        time.sleep(0.5)
-        
-        # Try to grab a frame with error handling
-        frame = None
-        max_attempts = 3
-        
-        for attempt in range(max_attempts):
-            try:
-                # Grab frame without timeout parameter
-                with QMutexLocker(self.camera_lock):
-                    frame_list = self.camera.grab(3)
-                    
-                    if frame_list:
-                        frame = np.array(frame_list[0])
-                        self.last_frame = frame
-                        break  # Success, exit the retry loop
-                    else:
-                        print(f"No frames received on capture attempt {attempt+1}/{max_attempts}")
-            except Exception as e:
-                print(f"Error capturing frame (attempt {attempt+1}/{max_attempts}): {e}")
-            
-            # Wait before retry
-            time.sleep(0.5)
-        
-        if frame is None:
-            print("Failed to capture image after multiple attempts")
-            return None
-        
-        # Process captured frame
-        processed_frame = self.process_frame(frame)
-        
-        # Create a folder for auto-capture if this is part of an auto-capture sequence
-        if hasattr(self, 'auto_capture_in_progress') and self.auto_capture_in_progress:
-            # Use the timestamp-based folder if available
-            if hasattr(self, 'current_capture_folder') and self.current_capture_folder:
-                folder_path = self.current_capture_folder
-            else:
-                # Create a new timestamped folder
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                folder_name = f"auto_capture_{timestamp}"
-                folder_path = os.path.join(os.path.expanduser("~"), "Downloads", folder_name)
-                os.makedirs(folder_path, exist_ok=True)
-                self.current_capture_folder = folder_path
-                
-            # Save to the auto-capture folder
-            self._save_frame_to_folder(frame, filename, folder_path)
-        else:
-            # Save to downloads folder
-            self._save_frame_to_downloads(frame, filename)
-        
-        return processed_frame
-
-    def _save_frame_to_folder(self, frame, filename, folder_path):
-        """Save a camera frame to the specified folder"""
-        try:
-            # Full path to save
-            save_path = os.path.join(folder_path, filename)
-            
-            # Create a properly scaled version based on file format
-            base_name, ext = os.path.splitext(filename)
-            if ext.lower() in ['.tif', '.tiff']:
-                # For TIFF, keep original bit depth
-                cv2.imwrite(save_path, frame)
-            else:
-                # For PNG, JPG, etc., convert to 8-bit
-                if frame.max() > 0:
-                    # Simple normalization
-                    min_val = frame.min()
-                    max_val = frame.max()
-                    scaled = (frame - min_val) / (max_val - min_val) * 255.0
-                    frame_uint8 = scaled.astype(np.uint8)
-                else:
-                    frame_uint8 = np.zeros_like(frame, dtype=np.uint8)
-                    
-                # Convert to RGB if grayscale
-                if len(frame_uint8.shape) == 2:
-                    frame_uint8 = cv2.cvtColor(frame_uint8, cv2.COLOR_GRAY2BGR)
-                    
-                # Save the image
-                cv2.imwrite(save_path, frame_uint8)
-                
-            print(f"Frame saved to {save_path}")
-            return save_path
-        except Exception as e:
-            print(f"Error saving frame: {e}")
-            return None
-            
-    def capture_and_save_image(self):
-        self.capture_image(filename="captured_image.png")
-
-    def save_last_frame(self):
-        if self.last_frame is None:
-            print("[SAVE] No current frame available to save!")
-            return
-        self._save_frame_to_downloads(self.last_frame, "current_frame.png")
-
-    def _save_frame_to_downloads(self, frame, filename):
-        """Save a camera frame to the Downloads folder"""
-        try:
-            # Determine where to save the file
-            if os.name == 'nt':  # Windows
-                downloads = os.path.join(os.path.expanduser("~"), "Downloads")
-            else:  # macOS/Linux
-                downloads = os.path.join(os.path.expanduser("~"), "Downloads")
-                
-            # Create a timestamp for unique filenames
-            timestamp = time.strftime("%Y%m%d-%H%M%S")
-            
-            # Extract file extension
-            _, ext = os.path.splitext(filename)
-            if not ext:
-                ext = ".png"  # Default to PNG
-                
-            # Add timestamp to filename
-            base_name, ext = os.path.splitext(filename)
-            timestamped_filename = f"{base_name}_{timestamp}{ext}"
-            
-            # Use the _save_frame_to_folder method to avoid code duplication
-            return self._save_frame_to_folder(frame, timestamped_filename, downloads)
-        except Exception as e:
-            print(f"Error saving frame to downloads: {e}")
-            return None
-
-    def analyze_bayer_pattern(self, frame):
-        """Analyze the Bayer pattern of the camera sensor"""
-        if frame is None or frame.size == 0:
-            print("No frame available for pattern analysis")
-            return None
-            
-        # Convert to float32 for analysis
-        frame = frame.astype(np.float32)
-        
-        # Handle both 2D and 3D frames
-        if len(frame.shape) == 3:
-            # If RGB, convert to grayscale using mean of channels
-            frame = np.mean(frame, axis=2)
-        
-        # Get a small region from the center of the image
-        height, width = frame.shape
-        center_h = height // 2
-        center_w = width // 2
-        region_size = 4  # Look at a 4x4 region
-        
-        # Extract the region
-        region = frame[center_h-region_size//2:center_h+region_size//2,
-                      center_w-region_size//2:center_w+region_size//2]
-        
-        print("\nBayer Pattern Analysis:")
-        print("Raw values in center region:")
-        print(region)
-        
-        # Analyze the pattern
-        # Look at the first 2x2 pixels to determine the pattern
-        pattern = region[:2, :2]
-        print("\nFirst 2x2 pixels:")
-        print(pattern)
-        
-        # Determine the pattern
-        if pattern[0,0] > pattern[0,1] and pattern[0,0] > pattern[1,0]:
-            print("\nDetected RGGB pattern (Red at top-left)")
-            return "RGGB"
-        elif pattern[0,0] > pattern[0,1] and pattern[0,0] < pattern[1,0]:
-            print("\nDetected GRBG pattern (Green at top-left)")
-            return "GRBG"
-        elif pattern[0,0] < pattern[0,1] and pattern[0,0] > pattern[1,0]:
-            print("\nDetected GBRG pattern (Green at top-left)")
-            return "GBRG"
-        elif pattern[0,0] < pattern[0,1] and pattern[0,0] < pattern[1,0]:
-            print("\nDetected BGGR pattern (Blue at top-left)")
-            return "BGGR"
-        else:
-            print("\nCould not determine pattern")
-            return None
 
     def get_white_balance_scales(self):
         """Return the white balance scaling factors"""
@@ -1784,6 +1765,242 @@ class MicroscopeHardware:
             # Emit a signal that the LED has been turned off (to be connected to UI)
             return True
         return False
+
+    def save_last_frame(self):
+        """Save the most recently captured frame to the Downloads folder"""
+        # Use a local copy of the last frame to avoid locking issues
+        with QMutexLocker(self.camera_lock):
+            if self.last_frame is None:
+                print("[SAVE] No current frame available to save!")
+                return None
+            # Make a copy while holding the lock
+            frame_to_save = self.last_frame.copy()
+        
+        # Create a timestamp for the filename
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"microscope_image_{timestamp}.png"
+        
+        # Save to downloads folder (outside the lock to avoid blocking camera)
+        saved_path = self._save_frame_to_downloads(frame_to_save, filename)
+        
+        if saved_path:
+            print(f"Image saved to {saved_path}")
+        else:
+            print("Failed to save image")
+        
+        return saved_path
+
+    def _save_frame_to_downloads(self, frame, filename):
+        """Save a camera frame to the Downloads folder"""
+        try:
+            # Determine where to save the file
+            if os.name == 'nt':  # Windows
+                downloads = os.path.join(os.path.expanduser("~"), "Downloads")
+            else:  # macOS/Linux
+                downloads = os.path.join(os.path.expanduser("~"), "Downloads")
+                
+            # Extract file extension
+            _, ext = os.path.splitext(filename)
+            if not ext:
+                ext = ".png"  # Default to PNG
+                
+            # Use the _save_frame_to_folder method to avoid code duplication
+            return self._save_frame_to_folder(frame, filename, downloads)
+        except Exception as e:
+            print(f"Error saving frame to downloads: {e}")
+            return None
+
+    def _save_frame_to_folder(self, frame, filename, folder_path):
+        """Save a camera frame to the specified folder"""
+        try:
+            # Full path to save
+            save_path = os.path.join(folder_path, filename)
+            
+            # Create a properly processed version based on file format
+            base_name, ext = os.path.splitext(filename)
+            
+            # Process the frame based on the camera type
+            if ext.lower() in ['.tif', '.tiff']:
+                # For TIFF, save the original raw frame to preserve bit depth
+                cv2.imwrite(save_path, frame)
+            else:
+                # For PNG, JPG, etc. - use a safer approach to color conversion
+                if self._mono_to_color_processor is not None and self._is_color:
+                    try:
+                        # For color camera with ThorLabs SDK, use the SDK's color processor
+                        width = frame.shape[1]
+                        height = frame.shape[0]
+                        
+                        # Create a copy of the frame to ensure it's contiguous in memory
+                        frame_copy = np.ascontiguousarray(frame)
+                        
+                        # Process the Bayer pattern raw data to RGB
+                        color_image_data = self._mono_to_color_processor.transform_to_24(
+                            frame_copy, width, height
+                        )
+                        
+                        # Reshape to proper dimensions
+                        color_image_data = color_image_data.reshape(height, width, 3)
+                        
+                        # Convert BGR to RGB for OpenCV
+                        color_image_data = cv2.cvtColor(color_image_data, cv2.COLOR_RGB2BGR)
+                        
+                        # Save the color image
+                        cv2.imwrite(save_path, color_image_data)
+                    except Exception as e:
+                        print(f"Failed to use SDK color processor: {e}, falling back to simple normalization")
+                        # Fall back to simple conversion if SDK processing fails
+                        if frame.max() > 0:
+                            scaled = (frame / frame.max() * 255.0).astype(np.uint8)
+                            if len(frame.shape) == 2:  # If grayscale
+                                scaled = cv2.cvtColor(scaled, cv2.COLOR_GRAY2BGR)
+                            cv2.imwrite(save_path, scaled)
+                        else:
+                            # Just create a blank black image
+                            blank = np.zeros((height, width, 3), dtype=np.uint8)
+                            cv2.imwrite(save_path, blank)
+                else:
+                    # For other camera types or monochrome cameras
+                    if frame.max() > 0:
+                        # Simple normalization for non-SDK cameras
+                        min_val = frame.min()
+                        max_val = frame.max()
+                        scaled = (frame - min_val) / (max_val - min_val) * 255.0
+                        frame_uint8 = scaled.astype(np.uint8)
+                    else:
+                        frame_uint8 = np.zeros_like(frame, dtype=np.uint8)
+                        
+                    # Convert to RGB if grayscale
+                    if len(frame_uint8.shape) == 2:
+                        frame_uint8 = cv2.cvtColor(frame_uint8, cv2.COLOR_GRAY2BGR)
+                        
+                    # Save the image
+                    cv2.imwrite(save_path, frame_uint8)
+                
+            print(f"Frame saved to {save_path}")
+            return save_path
+        except Exception as e:
+            print(f"Error saving frame: {e}")
+            return None
+
+    def capture_image(self, filename="captured_image.png"):
+        if not self.camera:
+            print("No camera available for capture!")
+            return None
+        
+        # Turn on LED for capture
+        self.turn_on_led()
+        time.sleep(0.5)  # Let LED brightness stabilize and camera gain adjust
+        
+        # Try to grab a frame based on camera type
+        frame = None
+        
+        # Check if we're using ThorLabs SDK directly
+        if hasattr(self, '_camera_sdk') and self._camera_sdk is not None:
+            # Using ThorLabs SDK
+            max_attempts = 5  # Increased attempts
+            for attempt in range(max_attempts):
+                try:
+                    # First check if we already have a recent frame available
+                    with QMutexLocker(self.camera_lock):
+                        if self.last_frame is not None:
+                            # Use the last frame if it's recent enough (less than 1 second old)
+                            if hasattr(self, 'last_frame_time') and time.time() - self.last_frame_time < 1.0:
+                                frame = self.last_frame.copy()
+                                break
+                    
+                    # If we don't have a recent frame, trigger and get one
+                    self.camera.issue_software_trigger()
+                    timeout_ms = 1500  # Increased timeout to 1.5 seconds
+                    start_time = time.time()
+                    
+                    while time.time() - start_time < timeout_ms/1000:
+                        camera_frame = self.camera.get_pending_frame_or_null()
+                        if camera_frame is not None:
+                            frame = camera_frame.image_buffer.copy()
+                            with QMutexLocker(self.camera_lock):
+                                self.last_frame = frame.copy()
+                                self.last_frame_time = time.time()
+                            break
+                        time.sleep(0.01)
+                        
+                    if frame is not None:
+                        break  # Success, exit retry loop
+                except Exception as e:
+                    print(f"Error capturing frame with ThorLabs SDK (attempt {attempt+1}/{max_attempts}): {e}")
+                time.sleep(0.2)  # Wait before retry - shorter delay
+        
+        else:
+            # Using pylablib camera
+            max_attempts = 5  # Increased attempts
+            for attempt in range(max_attempts):
+                try:
+                    # First check if we already have a recent frame available
+                    with QMutexLocker(self.camera_lock):
+                        if self.last_frame is not None:
+                            # Use the last frame if it's recent enough (less than 1 second old)
+                            if hasattr(self, 'last_frame_time') and time.time() - self.last_frame_time < 1.0:
+                                frame = self.last_frame.copy()
+                                break
+                    
+                    # If we don't have a recent frame, grab a new one
+                    with QMutexLocker(self.camera_lock):
+                        frame_list = self.camera.grab(3)
+                        
+                        if frame_list:
+                            frame = np.array(frame_list[0])
+                            self.last_frame = frame.copy()
+                            self.last_frame_time = time.time()
+                            break  # Success, exit the retry loop
+                        else:
+                            print(f"No frames received on capture attempt {attempt+1}/{max_attempts}")
+                except Exception as e:
+                    print(f"Error capturing frame with pylablib (attempt {attempt+1}/{max_attempts}): {e}")
+                
+                # Wait before retry
+                time.sleep(0.2)  # Shorter delay
+        
+        if frame is None:
+            print("Failed to capture image after multiple attempts")
+            return None
+        
+        # Process captured frame
+        processed_frame = None
+        try:
+            processed_frame = self.process_frame(frame.copy())
+        except Exception as e:
+            print(f"Error processing frame: {e}")
+            # Fallback to simple processing
+            processed_frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR) if len(frame.shape) == 2 else frame.copy()
+        
+        # Create a folder for auto-capture if this is part of an auto-capture sequence
+        if hasattr(self, 'auto_capture_in_progress') and self.auto_capture_in_progress:
+            # Use the timestamp-based folder if available
+            folder_path = None
+            if hasattr(self, 'current_capture_folder') and self.current_capture_folder:
+                folder_path = self.current_capture_folder
+            elif hasattr(self, 'auto_capture_folder') and self.auto_capture_folder:
+                folder_path = self.auto_capture_folder
+            else:
+                # Create a new timestamped folder
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                folder_name = f"auto_capture_{timestamp}"
+                folder_path = os.path.join(os.path.expanduser("~"), "Downloads", folder_name)
+                os.makedirs(folder_path, exist_ok=True)
+                self.current_capture_folder = folder_path
+                
+            # Save to the auto-capture folder
+            try:
+                self._save_frame_to_folder(frame, filename, folder_path)
+            except Exception as e:
+                print(f"Error saving to auto-capture folder: {e}")
+                # Try saving to downloads as a fallback
+                self._save_frame_to_downloads(frame, filename)
+        else:
+            # Save to downloads folder
+            self._save_frame_to_downloads(frame, filename)
+        
+        return processed_frame
 
 
 ###############################################################################
@@ -2123,20 +2340,7 @@ class CameraDisplayWidget(QLabel):
         print(f"Click at image coords: ({image_x:.2f}, {image_y:.2f}); Pixel delta: ({delta_pixels_x:.2f}, {delta_pixels_y:.2f}); Moving stage by: ({move_x:.3f} mm, {move_y:.3f} mm)")
         self.hardware.move_stage(x=move_x, y=move_y)
         
-    def paintEvent(self, event):
-        super().paintEvent(event)
-        
-        # Add FPS counter overlay if enabled
-        if self.show_fps and CUDA_AVAILABLE and self.pixmap() is not None:
-            painter = QPainter(self)
-            painter.setPen(QPen(Qt.green, 1, Qt.SolidLine))
-            painter.setFont(QFont("Arial", 10))
-            
-            # Draw FPS counter in the top-left corner
-            cuda_status = "CUDA: ON" if CUDA_AVAILABLE else "CUDA: OFF"
-            painter.drawText(10, 20, f"{cuda_status} | FPS: {self.fps:.1f}")
-            
-            painter.end()
+    
     
     def toggle_fps_display(self):
         self.show_fps = not self.show_fps
@@ -2293,11 +2497,11 @@ class ControlPanelWidget(QWidget):
         self.exposure_label = QLabel("0.1 s")
         camera_layout.addWidget(self.exposure_label, 0, 2)
         
-        # Autoexposure checkbox
-        self.autoexposure_checkbox = QCheckBox("Auto")
-        self.autoexposure_checkbox.setChecked(False)
-        self.autoexposure_checkbox.stateChanged.connect(self.autoexposure_toggled)
-        camera_layout.addWidget(self.autoexposure_checkbox, 0, 3)
+        # # Autoexposure checkbox
+        # self.autoexposure_checkbox = QCheckBox("Auto")
+        # self.autoexposure_checkbox.setChecked(False)
+        # self.autoexposure_checkbox.stateChanged.connect(self.autoexposure_toggled)
+        # camera_layout.addWidget(self.autoexposure_checkbox, 0, 3)
         
         # Exposure manual input
         camera_layout.addWidget(QLabel("Exposure (s):"), 1, 0)
@@ -2308,13 +2512,13 @@ class ControlPanelWidget(QWidget):
         camera_layout.addWidget(self.exposure_input, 1, 1, 1, 2)
         
         # Target brightness slider (only visible when autoexposure is enabled)
-        camera_layout.addWidget(QLabel("Target:"), 2, 0)
-        self.target_slider = QSlider(Qt.Horizontal)
-        self.target_slider.setRange(10, 90)  # Target brightness (10-90%)
-        self.target_slider.setValue(50)      # default 50%
-        self.target_slider.valueChanged.connect(self.update_target_brightness)
-        self.target_slider.setEnabled(False)  # disabled initially
-        camera_layout.addWidget(self.target_slider, 2, 1)
+        # camera_layout.addWidget(QLabel("Target:"), 2, 0)
+        # self.target_slider = QSlider(Qt.Horizontal)
+        # self.target_slider.setRange(10, 90)  # Target brightness (10-90%)
+        # self.target_slider.setValue(50)      # default 50%
+        # self.target_slider.valueChanged.connect(self.update_target_brightness)
+        # self.target_slider.setEnabled(False)  # disabled initially
+        # camera_layout.addWidget(self.target_slider, 2, 1)
         
         # Target brightness value label
         self.target_label = QLabel("50%")
@@ -2332,68 +2536,80 @@ class ControlPanelWidget(QWidget):
         self.capture_button.clicked.connect(self.save_current_photo_clicked)
         capture_layout.addWidget(self.capture_button, 0, 0, 1, 2)  # span 2 columns
         
+        # Preview Field button
+        self.preview_field_button = QPushButton("Preview Field")
+        # Don't use lambda with parent() - it's not reliable
+        # Instead, we'll connect this in MainWindow after setup
+        capture_layout.addWidget(self.preview_field_button, 1, 0, 1, 2)  # span 2 columns
+        
         # Auto-capture button
         self.auto_capture_button = QPushButton("Auto Capture")
         self.auto_capture_button.clicked.connect(self.auto_capture_clicked)
-        capture_layout.addWidget(self.auto_capture_button, 1, 0, 1, 2)  # span 2 columns
+        capture_layout.addWidget(self.auto_capture_button, 2, 0, 1, 2)  # span 2 columns
+        
+        # Stop button
+        self.stop_button = QPushButton("Stop Capture")
+        self.stop_button.clicked.connect(lambda: self.parent().stop_capture_processes() if self.parent() else None)
+        self.stop_button.setEnabled(False)  # Initially disabled
+        capture_layout.addWidget(self.stop_button, 3, 0, 1, 2)  # span 2 columns
         
         # Capture type
-        capture_layout.addWidget(QLabel("Capture Type:"), 2, 0)
+        capture_layout.addWidget(QLabel("Capture Type:"), 4, 0)
         self.capture_type_combo = QComboBox()
         self.capture_type_combo.addItems(["XY Grid", "Z Stack", "XYZ Combined"])
-        capture_layout.addWidget(self.capture_type_combo, 2, 1)
+        capture_layout.addWidget(self.capture_type_combo, 4, 1)
         
         # Pattern Size X
-        capture_layout.addWidget(QLabel("Grid Width (mm):"), 3, 0)
+        capture_layout.addWidget(QLabel("Grid Width (mm):"), 5, 0)
         self.pattern_x_spin = QDoubleSpinBox()
         self.pattern_x_spin.setRange(1.0, 100.0)
         self.pattern_x_spin.setValue(15.0)
         self.pattern_x_spin.setSingleStep(1.0)
         self.pattern_x_spin.setDecimals(1)
-        capture_layout.addWidget(self.pattern_x_spin, 3, 1)
+        capture_layout.addWidget(self.pattern_x_spin, 5, 1)
         
         # Pattern Size Y
-        capture_layout.addWidget(QLabel("Grid Height (mm):"), 4, 0)
+        capture_layout.addWidget(QLabel("Grid Height (mm):"), 6, 0)
         self.pattern_y_spin = QDoubleSpinBox()
         self.pattern_y_spin.setRange(1.0, 100.0)
         self.pattern_y_spin.setValue(15.0)
         self.pattern_y_spin.setSingleStep(1.0)
         self.pattern_y_spin.setDecimals(1)
-        capture_layout.addWidget(self.pattern_y_spin, 4, 1)
+        capture_layout.addWidget(self.pattern_y_spin, 6, 1)
         
         # Overlap %
-        capture_layout.addWidget(QLabel("Overlap (%):"), 5, 0)
+        capture_layout.addWidget(QLabel("Overlap (%):"), 7, 0)
         self.overlap_spin = QSpinBox()
-        self.overlap_spin.setRange(0, 50)
+        self.overlap_spin.setRange(0, 75)
         self.overlap_spin.setValue(25)
-        capture_layout.addWidget(self.overlap_spin, 5, 1)
+        capture_layout.addWidget(self.overlap_spin, 7, 1)
         
         # Z Stack Settings
-        capture_layout.addWidget(QLabel("Z Stack Steps:"), 6, 0)
+        capture_layout.addWidget(QLabel("Z Stack Steps:"), 8, 0)
         self.z_stack_spin = QSpinBox()
         self.z_stack_spin.setRange(2, 100)
         self.z_stack_spin.setValue(5)
-        capture_layout.addWidget(self.z_stack_spin, 6, 1)
+        capture_layout.addWidget(self.z_stack_spin, 8, 1)
         
         # Z Stack Height
-        capture_layout.addWidget(QLabel("Z Height (mm):"), 7, 0)
+        capture_layout.addWidget(QLabel("Z Height (mm):"), 9, 0)
         self.z_height_spin = QDoubleSpinBox()
         self.z_height_spin.setRange(0.001, 10.0)
         self.z_height_spin.setValue(0.5)
         self.z_height_spin.setSingleStep(0.1)
         self.z_height_spin.setDecimals(2)
-        capture_layout.addWidget(self.z_height_spin, 7, 1)
+        capture_layout.addWidget(self.z_height_spin, 9, 1)
         
         # Progress bar
-        capture_layout.addWidget(QLabel("Progress:"), 8, 0)
+        capture_layout.addWidget(QLabel("Progress:"), 10, 0)
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
-        capture_layout.addWidget(self.progress_bar, 8, 1)
+        capture_layout.addWidget(self.progress_bar, 10, 1)
         
         # Status label
         self.status_label = QLabel("Ready")
-        capture_layout.addWidget(self.status_label, 9, 0, 1, 2)  # span 2 columns
+        capture_layout.addWidget(self.status_label, 11, 0, 1, 2)  # span 2 columns
         
         layout.addWidget(capture_group)
         
@@ -2639,6 +2855,10 @@ class ControlPanelWidget(QWidget):
         self.status_label.setText("Starting capture...")
         self.progress_bar.setValue(0)
         
+        # Enable stop button
+        if hasattr(self, 'stop_button'):
+            self.stop_button.setEnabled(True)
+        
         # Convert capture mode to worker mode
         mode_map = {
             "XY Grid": "xy",
@@ -2673,10 +2893,14 @@ class ControlPanelWidget(QWidget):
         self.hardware.auto_capture_in_progress = False
         self.hardware.auto_capture_folder = None
         
+        # Disable the stop button
+        if hasattr(self, 'stop_button'):
+            self.stop_button.setEnabled(False)
+        
         # Make sure LED checkbox is unchecked since the LED is turned off in hardware
         if self.led_enable.isChecked():
             self.led_enable.setChecked(False)
-        
+    
     def save_current_photo_clicked(self):
         """Save current frame"""
         self.hardware.save_last_frame()
@@ -2726,16 +2950,8 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("Microscope Control UI")
         
-        # Create status bar with CUDA info
-        self.statusBar().showMessage(f"CUDA Acceleration: {'Enabled' if CUDA_AVAILABLE else 'Disabled'}")
         
-        # Add FPS display toggle button to status bar
-        if CUDA_AVAILABLE:
-            self.fps_button = QPushButton("Hide FPS")
-            self.fps_button.setCheckable(True)
-            self.fps_button.setChecked(True)
-            self.fps_button.clicked.connect(self.toggle_fps_display)
-            self.statusBar().addPermanentWidget(self.fps_button)
+       
         
         # Initialize hardware
         self.hardware = MicroscopeHardware()
@@ -2862,55 +3078,16 @@ class MainWindow(QMainWindow):
                         self.statusBar().showMessage("All axes homed successfully")
 
     def add_preview_field_button(self):
-        """Add the Preview Field button to the control panel"""
-        # Create Preview Field button and Stop buttons
-        self.preview_button = QPushButton("Preview Field")
-        self.preview_button.clicked.connect(self.start_preview_field)
+        """Connect to the Preview Field and Stop buttons in the control panel"""
+        # Connect the stop button in the control panel
+        if hasattr(self.control_panel, 'stop_button'):
+            self.stop_button = self.control_panel.stop_button
         
-        self.auto_capture_button = QPushButton("Auto Capture")
-        self.auto_capture_button.clicked.connect(self.start_auto_capture)
-        
-        self.stop_button = QPushButton("Stop Capture")
-        self.stop_button.clicked.connect(self.stop_capture_processes)
-        self.stop_button.setEnabled(False)  # Initially disabled until process starts
-        
-        # Get the capture group from the control panel
-        capture_group = None
-        for i in range(self.control_panel.layout().count()):
-            item = self.control_panel.layout().itemAt(i)
-            if item.widget() and isinstance(item.widget(), QGroupBox) and item.widget().title() == "Capture Controls":
-                capture_group = item.widget()
-                break
-        
-        # Insert buttons into the layout
-        if capture_group:
-            layout = capture_group.layout()
-            if isinstance(layout, QGridLayout):
-                # For QGridLayout, add the buttons at specific positions
-                # First, find the position of the "Take Photo" button
-                take_photo_row = -1
-                for row in range(layout.rowCount()):
-                    item = layout.itemAtPosition(row, 0)
-                    if item and item.widget() and isinstance(item.widget(), QPushButton) and item.widget().text() == "Take Photo":
-                        take_photo_row = row
-                        break
-                
-                # Add our buttons in sequence after Take Photo
-                insert_row = take_photo_row + 1 if take_photo_row != -1 else 1
-                layout.addWidget(self.preview_button, insert_row, 0, 1, 2)  # span 2 columns
-                layout.addWidget(self.auto_capture_button, insert_row + 1, 0, 1, 2)  # span 2 columns
-                layout.addWidget(self.stop_button, insert_row + 2, 0, 1, 2)  # span 2 columns
-            else:
-                # For other layouts like QVBoxLayout
-                try:
-                    layout.insertWidget(1, self.preview_button)
-                    layout.insertWidget(2, self.auto_capture_button)
-                    layout.insertWidget(3, self.stop_button)
-                except AttributeError:
-                    # Fallback - just add the buttons
-                    layout.addWidget(self.preview_button)
-                    layout.addWidget(self.auto_capture_button)
-                    layout.addWidget(self.stop_button)
+        # Connect the preview field button to our start_preview_field method
+        if hasattr(self.control_panel, 'preview_field_button'):
+            self.preview_button = self.control_panel.preview_field_button
+            # Direct connection to our method
+            self.preview_button.clicked.connect(self.start_preview_field)
 
     def start_preview_field(self):
         """Handler for Preview Field button click - start preview field scan"""
@@ -3087,8 +3264,11 @@ class MainWindow(QMainWindow):
                 self.control_panel.led_enable.setEnabled(True)
         
         # Make sure target brightness is set correctly
-        self.control_panel.target_slider.setValue(self.hardware.autoexposure_target)
-        self.control_panel.target_label.setText(f"{self.hardware.autoexposure_target}%")
+        if hasattr(self.control_panel, 'target_slider'):
+            self.control_panel.target_slider.setValue(self.hardware.autoexposure_target)
+        
+        if hasattr(self.control_panel, 'target_label'):
+            self.control_panel.target_label.setText(f"{self.hardware.autoexposure_target}%")
 
     @pyqtSlot(np.ndarray)
     def on_new_frame(self, frame):
@@ -3143,25 +3323,41 @@ class MainWindow(QMainWindow):
         )
 
     def start_auto_capture(self):
-        """Handler for Auto Capture button"""
+        """Start auto-capture - just forward to control panel's auto_capture_clicked method"""
         if hasattr(self.control_panel, 'auto_capture_clicked'):
             self.control_panel.auto_capture_clicked()
-            self.stop_button.setEnabled(True)
-
+        
     def stop_capture_processes(self):
-        """Stop any running preview field or auto capture processes"""
-        # Stop preview field if running
-        if hasattr(self, 'preview_worker') and self.preview_worker and self.preview_worker.isRunning():
-            self.preview_worker.stop()
-            self.statusBar().showMessage("Preview field capture stopped")
+        """Stop any active capture processes"""
+        # Stop preview worker if running
+        if self.preview_worker and self.preview_worker.isRunning():
+            self.preview_worker.running = False
+            self.preview_worker.wait(1000)  # Wait up to 1 second
+            self.statusBar().showMessage("Preview scan stopped")
+            if hasattr(self.control_panel, 'status_label'):
+                self.control_panel.status_label.setText("Preview cancelled")
+            if hasattr(self.control_panel, 'progress_bar'):
+                self.control_panel.progress_bar.setValue(0)
         
-        # Stop auto capture if running
-        if hasattr(self.control_panel, 'auto_capture_worker') and self.control_panel.auto_capture_worker and self.control_panel.auto_capture_worker.isRunning():
-            self.control_panel.auto_capture_worker.running = False
-            self.statusBar().showMessage("Auto capture stopped")
+        # Stop auto-capture worker if running
+        if hasattr(self.hardware, 'auto_capture_worker') and self.hardware.auto_capture_worker and self.hardware.auto_capture_worker.isRunning():
+            self.hardware.auto_capture_worker.terminate()
+            self.hardware.auto_capture_worker.wait(1000)  # Wait up to 1 second
+            self.hardware.auto_capture_in_progress = False
+            self.statusBar().showMessage("Auto-capture stopped")
+            if hasattr(self.control_panel, 'status_label'):
+                self.control_panel.status_label.setText("Capture cancelled")
+            if hasattr(self.control_panel, 'progress_bar'):
+                self.control_panel.progress_bar.setValue(0)
+            if hasattr(self.control_panel, 'auto_capture_button'):
+                self.control_panel.auto_capture_button.setEnabled(True)
         
-        # Disable the stop button
-        self.stop_button.setEnabled(False)
+        # Disable stop button
+        if hasattr(self.control_panel, 'stop_button'):
+            self.control_panel.stop_button.setEnabled(False)
+        
+        # Make sure camera is running
+        self.hardware.start_camera()
 
 
 ###############################################################################
@@ -3175,3 +3371,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
