@@ -15,6 +15,7 @@ import os
 from PyQt5.QtWidgets import QApplication, QMainWindow, QLabel, QPushButton, QVBoxLayout, QHBoxLayout, QWidget
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtGui import QImage, QPixmap, QFont
+from datetime import datetime
 
 # Configure DLL path
 def configure_path():
@@ -57,6 +58,7 @@ class CameraThread(QThread):
     """Thread for continuous image acquisition"""
     new_frame = pyqtSignal(np.ndarray)
     fps_update = pyqtSignal(float)
+    raw_frame = pyqtSignal(np.ndarray)  # New signal for raw frame data
 
     def __init__(self, camera):
         super().__init__()
@@ -94,18 +96,31 @@ class CameraThread(QThread):
             self._image_height = height
             print("Image dimension change detected, updating color processor")
             
-        # color the image. transform_to_24 will scale to 8 bits per channel
+        # Get the raw frame data first
+        raw_data = frame.image_buffer.copy()
+        
+        # color the image for display. transform_to_24 will scale to 8 bits per channel
         color_image_data = self._mono_to_color_processor.transform_to_24(
             frame.image_buffer,
             self._image_width,
             self._image_height
         )
         color_image_data = color_image_data.reshape(self._image_height, self._image_width, 3)
+        
+        # Emit both the display image and the raw data
+        self.raw_frame.emit(raw_data)
         return color_image_data
 
     def _get_mono_image(self, frame):
-        """Convert monochrome image to 8-bit"""
+        """Convert monochrome image to 8-bit for display"""
+        # Get the raw frame data first
+        raw_data = frame.image_buffer.copy()
+        
+        # Scale down to 8-bit for display
         scaled_image = frame.image_buffer >> (self.camera.bit_depth - 8)
+        
+        # Emit both the display image and the raw data
+        self.raw_frame.emit(raw_data)
         return scaled_image
 
     def run(self):
@@ -153,6 +168,9 @@ class MainWindow(QMainWindow):
         self.camera_thread = None
         self.sdk = None
         self.camera = None
+        self.current_frame = None  # Store the current frame
+        self.current_raw_frame = None  # Store the raw frame data
+        self.camera_bit_depth = None  # Store camera's native bit depth
 
         # Create UI elements
         self.init_ui()
@@ -182,6 +200,11 @@ class MainWindow(QMainWindow):
         self.toggle_button.clicked.connect(self.toggle_streaming)
         control_layout.addWidget(self.toggle_button)
 
+        # Save button
+        self.save_button = QPushButton("Save Image")
+        self.save_button.clicked.connect(self.save_current_frame)
+        control_layout.addWidget(self.save_button)
+
         # FPS display
         self.fps_label = QLabel("FPS: 0.0")
         self.fps_label.setFont(QFont("Arial", 14))
@@ -199,6 +222,10 @@ class MainWindow(QMainWindow):
             self.camera = self.sdk.open_camera(camera_list[0])
             print(f"Opened camera: {self.camera.name}")
             
+            # Get and store camera bit depth
+            self.camera_bit_depth = self.camera.bit_depth
+            print(f"Camera bit depth: {self.camera_bit_depth} bits")
+            
             # Print camera sensor type
             sensor_type = self.camera.camera_sensor_type
             print(f"Camera sensor type: {sensor_type}")
@@ -212,6 +239,7 @@ class MainWindow(QMainWindow):
             # Start camera thread
             self.camera_thread = CameraThread(self.camera)
             self.camera_thread.new_frame.connect(self.update_frame)
+            self.camera_thread.raw_frame.connect(self.update_raw_frame)
             self.camera_thread.fps_update.connect(self.update_fps)
             self.camera_thread.start()
             self.toggle_button.setText("Stop Stream")
@@ -221,6 +249,9 @@ class MainWindow(QMainWindow):
             self.display.setText("Failed to initialize camera")
 
     def update_frame(self, frame):
+        # Store the current frame
+        self.current_frame = frame.copy()
+        
         # Convert frame to QImage for display
         if len(frame.shape) == 2:  # Monochrome
             h, w = frame.shape
@@ -235,6 +266,10 @@ class MainWindow(QMainWindow):
         pixmap = QPixmap.fromImage(img)
         self.display.setPixmap(pixmap.scaled(self.display.size(), Qt.KeepAspectRatio, Qt.FastTransformation))
 
+    def update_raw_frame(self, frame):
+        """Store the raw frame data with full bit depth"""
+        self.current_raw_frame = frame.copy()
+
     def update_fps(self, fps):
         self.fps_label.setText(f"FPS: {fps:.1f}")
 
@@ -248,6 +283,31 @@ class MainWindow(QMainWindow):
                 self.toggle_button.setText("Stop Stream")
             else:
                 self.start_camera()
+
+    def save_current_frame(self):
+        if self.current_frame is None:
+            return
+
+        # Get user's downloads folder
+        downloads_folder = os.path.expanduser("~/Downloads")
+        
+        # Create filename with timestamp
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"camera_capture_{timestamp}.png"  # Changed to PNG for better 8-bit support
+        filepath = os.path.join(downloads_folder, filename)
+
+        try:
+            # Save the 8-bit display image
+            if len(self.current_frame.shape) == 2:  # Monochrome
+                cv2.imwrite(filepath, self.current_frame)
+            else:  # Color
+                # Convert RGB to BGR for OpenCV
+                bgr_image = cv2.cvtColor(self.current_frame, cv2.COLOR_RGB2BGR)
+                cv2.imwrite(filepath, bgr_image)
+            
+            print(f"Image saved to: {filepath}")
+        except Exception as e:
+            print(f"Error saving image: {e}")
 
     def closeEvent(self, event):
         if self.camera_thread:

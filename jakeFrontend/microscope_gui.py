@@ -795,7 +795,6 @@ class MicroscopeHardware:
         self.pid_prev_error = 0
         
         # Initialize hardware in a specific order
-        self._load_led_config()
         self._init_led_lib()
         self._detect_led_controllers()
         self._init_camera_hardware()
@@ -844,88 +843,7 @@ class MicroscopeHardware:
             first_led = next(iter(self.led_controllers))
             self.connect_led(first_led)
 
-    def _load_led_config(self):
-        """Load LED controller configuration from file"""
-        try:
-            if os.path.exists(self.config_file):
-                with open(self.config_file, 'r') as f:
-                    loaded_config = json.load(f)
-                print(f"Loaded LED configuration from {self.config_file}")
-                
-                # Validate that each controller is still accessible at the saved port
-                valid_controllers = {}
-                for led_type, info in loaded_config.items():
-                    port = info['port']
-                    resource = info['resource']
-                    print(f"Validating {led_type} on {port}...")
-                    
-                    # Try to connect to verify it's available
-                    handle = c_int(0)
-                    res = self.led_lib.TLUP_init(resource.encode(), 0, 0, byref(handle))
-                    
-                    if res != 0:
-                        print(f"  Warning: Cannot connect to {led_type} on {port}: error {res}")
-                        print(f"  This controller will be rediscovered during auto-detection")
-                        continue
-                    
-                    try:
-                        # Verify it's the correct type by checking the wavelength
-                        self.led_lib.TLUP_setLedUseNonThorlabsLed(handle, 1)
-                        
-                        LEDName = create_string_buffer(256)
-                        LEDSerialNumber = create_string_buffer(256)
-                        LEDCurrentLimit = c_double()
-                        LEDForwardVoltage = c_double()
-                        LEDWavelength = c_double(0)
-                        
-                        self.led_lib.TLUP_getLedInfo(handle, LEDName, LEDSerialNumber,
-                                                   byref(LEDCurrentLimit),
-                                                   byref(LEDForwardVoltage),
-                                                   byref(LEDWavelength))
-                        
-                        # Check if it's still the same LED type
-                        if ((led_type == "White LED" and LEDWavelength.value == -4000.0) or
-                            (led_type == "UV LED" and LEDWavelength.value == 275.0)):
-                            print(f"  Verified {led_type} on {port} is valid")
-                            valid_controllers[led_type] = info
-                        else:
-                            print(f"  Warning: LED type mismatch on {port}")
-                            print(f"    Expected: {led_type}, Found: wavelength {LEDWavelength.value}")
-                            print(f"  This controller will be rediscovered during auto-detection")
-                    except Exception as e:
-                        print(f"  Error validating {led_type} on {port}: {e}")
-                    finally:
-                        # Close the controller
-                        self.led_lib.TLUP_close(handle)
-                
-                # Update config with only valid controllers
-                self.led_controllers = valid_controllers
-                
-                if valid_controllers:
-                    print(f"Found {len(valid_controllers)} valid LED controller(s):")
-                    for led_type, info in valid_controllers.items():
-                        print(f"  {led_type}: {info['port']} ({info['led_model']})")
-                    return True
-                else:
-                    print("No valid controllers found in saved configuration")
-                    return False
-            else:
-                print(f"No configuration file found at {self.config_file}")
-                return False
-        except Exception as e:
-            print(f"Error loading LED configuration: {e}")
-            return False
 
-    def _save_led_config(self):
-        """Save LED controller configuration to file"""
-        try:
-            with open(self.config_file, 'w') as f:
-                json.dump(self.led_controllers, f, indent=2)
-            print(f"Saved LED configuration to {self.config_file}")
-            return True
-        except Exception as e:
-            print(f"Error saving LED configuration: {e}")
-            return False
 
     def _init_led_lib(self):
         """Load the LED library"""
@@ -938,13 +856,7 @@ class MicroscopeHardware:
                 print(f"Failed to load LED DLL at {dll_path}: {e}")
     
     def _detect_led_controllers(self):
-        """Auto-detect LED controllers on any available COM port"""
-        if self.led_lib is None:
-            print("LED library not loaded.")
-            return
-            
-        print("Auto-detecting LED controllers on all COM ports...")
-        
+        """Auto-detect LED controllers on any available COM port"""        
         # List of possible COM ports to try
         possible_ports = [f"COM{i}" for i in range(1, 20)]  # Check COM1 through COM19
         
@@ -953,8 +865,6 @@ class MicroscopeHardware:
             try:
                 resource_name = f"ASRL{port[3:]}::INSTR"  # Convert COM4 to ASRL4::INSTR
                 resource_bytes = resource_name.encode()
-                
-                print(f"Checking {port} ({resource_name})...")
                 handle = c_int(0)
                 res = self.led_lib.TLUP_init(resource_bytes, 0, 0, byref(handle))
                 
@@ -1184,7 +1094,7 @@ class MicroscopeHardware:
                     )
                     self._is_color = True
                     self.bayer_pattern = "BAYER"  # Generic label, actual pattern handled by SDK
-                    print(f"Camera is color (Bayer pattern), using ThorLabs color processing")
+                    print(f"Camera is color, using ThorLabs color processing")
                 else:
                     # Monochrome camera
                     self._is_color = False
@@ -1375,18 +1285,6 @@ class MicroscopeHardware:
         except Exception as e:
             print(f"Error configuring CS505CU1 camera: {e}")
 
-    def set_binning(self, binning_value):
-        """Set camera binning (1, 2, 4, 8, 16)"""
-        # This function is kept as a stub to avoid breaking references
-        # but functionality has been removed as requested
-        pass
-
-    def adjust_fov_for_binning(self):
-        """Adjust field of view calculation based on current binning"""
-        # This function is kept as a stub to avoid breaking references
-        # but functionality has been removed as requested
-        pass
-
     def start_camera(self):
         """Start camera acquisition"""
         if self.camera:
@@ -1492,7 +1390,6 @@ class MicroscopeHardware:
         """Process a frame from the camera for display using ThorLabs SDK or fallback processing"""
         if frame is None or frame.size == 0:
             return np.zeros((100, 100, 3), dtype=np.uint8)  # Return empty frame
-        
         # Store original frame for possible saving
         self.last_frame = frame.copy()
         self.last_frame_time = time.time()
@@ -1768,46 +1665,83 @@ class MicroscopeHardware:
 
     def save_last_frame(self):
         """Save the most recently captured frame to the Downloads folder"""
-        # Use a local copy of the last frame to avoid locking issues
-        with QMutexLocker(self.camera_lock):
-            if self.last_frame is None:
-                print("[SAVE] No current frame available to save!")
-                return None
-            # Make a copy while holding the lock
-            frame_to_save = self.last_frame.copy()
-        
-        # Create a timestamp for the filename
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"microscope_image_{timestamp}.png"
-        
-        # Save to downloads folder (outside the lock to avoid blocking camera)
-        saved_path = self._save_frame_to_downloads(frame_to_save, filename)
-        
-        if saved_path:
-            print(f"Image saved to {saved_path}")
-        else:
-            print("Failed to save image")
-        
-        return saved_path
-
-    def _save_frame_to_downloads(self, frame, filename):
-        """Save a camera frame to the Downloads folder"""
         try:
-            # Determine where to save the file
-            if os.name == 'nt':  # Windows
-                downloads = os.path.join(os.path.expanduser("~"), "Downloads")
-            else:  # macOS/Linux
-                downloads = os.path.join(os.path.expanduser("~"), "Downloads")
+            # Capture a fresh frame
+            with QMutexLocker(self.camera_lock):
+                if not self.camera:
+                    print("[SAVE] No camera available to save!")
+                    return None
                 
-            # Extract file extension
-            _, ext = os.path.splitext(filename)
-            if not ext:
-                ext = ".png"  # Default to PNG
+                # Trigger and get frame
+                self.camera.issue_software_trigger()
+                timeout_ms = 1000
+                start_time = time.time()
                 
-            # Use the _save_frame_to_folder method to avoid code duplication
-            return self._save_frame_to_folder(frame, filename, downloads)
+                frame = None
+                while time.time() - start_time < timeout_ms/1000:
+                    camera_frame = self.camera.get_pending_frame_or_null()
+                    if camera_frame is not None:
+                        frame = camera_frame.image_buffer
+                        break
+                    time.sleep(0.01)
+                
+                if frame is None:
+                    print("[SAVE] Failed to capture frame for saving")
+                    return None
+            
+            # Create a timestamp for the filename
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            downloads = os.path.join(os.path.expanduser("~"), "Downloads")
+            
+            # Save as 16-bit TIFF
+            if self._mono_to_color_processor is not None and self._is_color:
+                try:
+                    width = frame.shape[1]
+                    height = frame.shape[0]
+                    
+                    # Use ThorLabs color processor to transform to 48-bit RGB (16 bits per channel)
+                    color_image_data = self._mono_to_color_processor.transform_to_48(
+                        frame,
+                        width,
+                        height
+                    )
+                    # Reshape to proper dimensions
+                    color_image_data = color_image_data.reshape(height, width, 3)
+                    
+                    # Scale to use full 16-bit range (0-65535)
+                    # First normalize to 0-1 range
+                    min_val = color_image_data.min()
+                    max_val = color_image_data.max()
+                    if max_val > min_val:
+                        normalized = (color_image_data.astype(np.float32) - min_val) / (max_val - min_val)
+                        # Scale to 16-bit range
+                        scaled = (normalized * 65535).astype(np.uint16)
+                    else:
+                        scaled = color_image_data.astype(np.uint16)
+                    
+                    # Convert RGB to BGR for OpenCV
+                    scaled = cv2.cvtColor(scaled, cv2.COLOR_RGB2BGR)
+                    
+                    # Save as 16-bit TIFF
+                    tiff_filename = f"microscope_image_{timestamp}.tiff"
+                    tiff_path = os.path.join(downloads, tiff_filename)
+                    cv2.imwrite(tiff_path, scaled)
+                    print(f"16-bit image saved to {tiff_path}")
+                    return tiff_path
+                    
+                except Exception as e:
+                    print(f"Failed to save 16-bit version: {e}")
+                    return None
+            else:
+                # For monochrome cameras, save as 16-bit TIFF
+                tiff_filename = f"microscope_image_{timestamp}.tiff"
+                tiff_path = os.path.join(downloads, tiff_filename)
+                cv2.imwrite(tiff_path, frame.astype(np.uint16))
+                print(f"16-bit monochrome image saved to {tiff_path}")
+                return tiff_path
+                
         except Exception as e:
-            print(f"Error saving frame to downloads: {e}")
+            print(f"Error saving frame: {e}")
             return None
 
     def _save_frame_to_folder(self, frame, filename, folder_path):
@@ -1816,67 +1750,45 @@ class MicroscopeHardware:
             # Full path to save
             save_path = os.path.join(folder_path, filename)
             
-            # Create a properly processed version based on file format
-            base_name, ext = os.path.splitext(filename)
+            # Check if this is a field view (preview) image
+            is_field_view = "preview" in filename.lower() or "field" in filename.lower()
             
-            # Process the frame based on the camera type
-            if ext.lower() in ['.tif', '.tiff']:
-                # For TIFF, save the original raw frame to preserve bit depth
-                cv2.imwrite(save_path, frame)
+            if is_field_view:
+                # For field view, save as 8-bit JPG
+                processed_frame = self.process_frame(frame)
+                if processed_frame.shape[2] == 3:  # If RGB
+                    processed_frame = cv2.cvtColor(processed_frame, cv2.COLOR_RGB2BGR)
+                cv2.imwrite(save_path, processed_frame)
             else:
-                # For PNG, JPG, etc. - use a safer approach to color conversion
+                # For all other images, save as 16-bit TIFF
                 if self._mono_to_color_processor is not None and self._is_color:
-                    try:
-                        # For color camera with ThorLabs SDK, use the SDK's color processor
-                        width = frame.shape[1]
-                        height = frame.shape[0]
-                        
-                        # Create a copy of the frame to ensure it's contiguous in memory
-                        frame_copy = np.ascontiguousarray(frame)
-                        
-                        # Process the Bayer pattern raw data to RGB
-                        color_image_data = self._mono_to_color_processor.transform_to_24(
-                            frame_copy, width, height
-                        )
-                        
-                        # Reshape to proper dimensions
-                        color_image_data = color_image_data.reshape(height, width, 3)
-                        
-                        # Convert BGR to RGB for OpenCV
-                        color_image_data = cv2.cvtColor(color_image_data, cv2.COLOR_RGB2BGR)
-                        
-                        # Save the color image
-                        cv2.imwrite(save_path, color_image_data)
-                    except Exception as e:
-                        print(f"Failed to use SDK color processor: {e}, falling back to simple normalization")
-                        # Fall back to simple conversion if SDK processing fails
-                        if frame.max() > 0:
-                            scaled = (frame / frame.max() * 255.0).astype(np.uint8)
-                            if len(frame.shape) == 2:  # If grayscale
-                                scaled = cv2.cvtColor(scaled, cv2.COLOR_GRAY2BGR)
-                            cv2.imwrite(save_path, scaled)
-                        else:
-                            # Just create a blank black image
-                            blank = np.zeros((height, width, 3), dtype=np.uint8)
-                            cv2.imwrite(save_path, blank)
-                else:
-                    # For other camera types or monochrome cameras
-                    if frame.max() > 0:
-                        # Simple normalization for non-SDK cameras
-                        min_val = frame.min()
-                        max_val = frame.max()
-                        scaled = (frame - min_val) / (max_val - min_val) * 255.0
-                        frame_uint8 = scaled.astype(np.uint8)
+                    width = frame.shape[1]
+                    height = frame.shape[0]
+                    
+                    # Use ThorLabs color processor to transform to 48-bit RGB
+                    color_image_data = self._mono_to_color_processor.transform_to_48(
+                        frame,
+                        width,
+                        height
+                    )
+                    color_image_data = color_image_data.reshape(height, width, 3)
+                    
+                    # Scale to use full 16-bit range
+                    min_val = color_image_data.min()
+                    max_val = color_image_data.max()
+                    if max_val > min_val:
+                        normalized = (color_image_data.astype(np.float32) - min_val) / (max_val - min_val)
+                        scaled = (normalized * 65535).astype(np.uint16)
                     else:
-                        frame_uint8 = np.zeros_like(frame, dtype=np.uint8)
-                        
-                    # Convert to RGB if grayscale
-                    if len(frame_uint8.shape) == 2:
-                        frame_uint8 = cv2.cvtColor(frame_uint8, cv2.COLOR_GRAY2BGR)
-                        
-                    # Save the image
-                    cv2.imwrite(save_path, frame_uint8)
-                
+                        scaled = color_image_data.astype(np.uint16)
+                    
+                    # Convert RGB to BGR for OpenCV
+                    scaled = cv2.cvtColor(scaled, cv2.COLOR_RGB2BGR)
+                    cv2.imwrite(save_path, scaled)
+                else:
+                    # For monochrome cameras, save as 16-bit TIFF
+                    cv2.imwrite(save_path, frame.astype(np.uint16))
+            
             print(f"Frame saved to {save_path}")
             return save_path
         except Exception as e:
@@ -1901,106 +1813,81 @@ class MicroscopeHardware:
             max_attempts = 5  # Increased attempts
             for attempt in range(max_attempts):
                 try:
-                    # First check if we already have a recent frame available
                     with QMutexLocker(self.camera_lock):
-                        if self.last_frame is not None:
-                            # Use the last frame if it's recent enough (less than 1 second old)
-                            if hasattr(self, 'last_frame_time') and time.time() - self.last_frame_time < 1.0:
-                                frame = self.last_frame.copy()
-                                break
-                    
-                    # If we don't have a recent frame, trigger and get one
-                    self.camera.issue_software_trigger()
-                    timeout_ms = 1500  # Increased timeout to 1.5 seconds
-                    start_time = time.time()
-                    
-                    while time.time() - start_time < timeout_ms/1000:
-                        camera_frame = self.camera.get_pending_frame_or_null()
-                        if camera_frame is not None:
-                            frame = camera_frame.image_buffer.copy()
-                            with QMutexLocker(self.camera_lock):
-                                self.last_frame = frame.copy()
-                                self.last_frame_time = time.time()
-                            break
-                        time.sleep(0.01)
+                        # Disarm camera to ensure clean state
+                        if hasattr(self.camera, 'disarm'):
+                            self.camera.disarm()
                         
-                    if frame is not None:
-                        break  # Success, exit retry loop
+                        # Wait a bit to ensure any pending operations are complete
+                        time.sleep(0.1)
+                        
+                        # Re-arm camera for capture
+                        self.camera.arm(2)
+                        self.camera.issue_software_trigger()
+                        
+                        # Wait for frame with timeout
+                        timeout_ms = 1000
+                        start_time = time.time()
+                        
+                        while time.time() - start_time < timeout_ms/1000:
+                            camera_frame = self.camera.get_pending_frame_or_null()
+                            if camera_frame is not None:
+                                frame = camera_frame.image_buffer
+                                break
+                            time.sleep(0.01)
+                        
+                        if frame is not None:
+                            break  # Success
+                            
                 except Exception as e:
-                    print(f"Error capturing frame with ThorLabs SDK (attempt {attempt+1}/{max_attempts}): {e}")
-                time.sleep(0.2)  # Wait before retry - shorter delay
-        
+                    print(f"Error capturing frame (attempt {attempt+1}/{max_attempts}): {e}")
+                    time.sleep(0.5)  # Wait between attempts
+                    
+            if frame is None:
+                print("Failed to capture frame after multiple attempts")
+                return None
+                
+            # Save the frame
+            if filename:
+                self._save_frame_to_folder(frame, filename, self.auto_capture_folder or os.path.join(os.path.expanduser("~"), "Downloads"))
+                
+            # Store the frame for potential display
+            self.last_frame = frame.copy()
+            return frame
+            
         else:
-            # Using pylablib camera
-            max_attempts = 5  # Increased attempts
-            for attempt in range(max_attempts):
-                try:
-                    # First check if we already have a recent frame available
-                    with QMutexLocker(self.camera_lock):
-                        if self.last_frame is not None:
-                            # Use the last frame if it's recent enough (less than 1 second old)
-                            if hasattr(self, 'last_frame_time') and time.time() - self.last_frame_time < 1.0:
-                                frame = self.last_frame.copy()
-                                break
-                    
-                    # If we don't have a recent frame, grab a new one
-                    with QMutexLocker(self.camera_lock):
-                        frame_list = self.camera.grab(3)
-                        
-                        if frame_list:
-                            frame = np.array(frame_list[0])
-                            self.last_frame = frame.copy()
-                            self.last_frame_time = time.time()
-                            break  # Success, exit the retry loop
-                        else:
-                            print(f"No frames received on capture attempt {attempt+1}/{max_attempts}")
-                except Exception as e:
-                    print(f"Error capturing frame with pylablib (attempt {attempt+1}/{max_attempts}): {e}")
-                
-                # Wait before retry
-                time.sleep(0.2)  # Shorter delay
-        
-        if frame is None:
-            print("Failed to capture image after multiple attempts")
-            return None
-        
-        # Process captured frame
-        processed_frame = None
-        try:
-            processed_frame = self.process_frame(frame.copy())
-        except Exception as e:
-            print(f"Error processing frame: {e}")
-            # Fallback to simple processing
-            processed_frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR) if len(frame.shape) == 2 else frame.copy()
-        
-        # Create a folder for auto-capture if this is part of an auto-capture sequence
-        if hasattr(self, 'auto_capture_in_progress') and self.auto_capture_in_progress:
-            # Use the timestamp-based folder if available
-            folder_path = None
-            if hasattr(self, 'current_capture_folder') and self.current_capture_folder:
-                folder_path = self.current_capture_folder
-            elif hasattr(self, 'auto_capture_folder') and self.auto_capture_folder:
-                folder_path = self.auto_capture_folder
-            else:
-                # Create a new timestamped folder
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                folder_name = f"auto_capture_{timestamp}"
-                folder_path = os.path.join(os.path.expanduser("~"), "Downloads", folder_name)
-                os.makedirs(folder_path, exist_ok=True)
-                self.current_capture_folder = folder_path
-                
-            # Save to the auto-capture folder
+            # Using pylablib
             try:
-                self._save_frame_to_folder(frame, filename, folder_path)
+                with QMutexLocker(self.camera_lock):
+                    # Stop any ongoing acquisition
+                    if hasattr(self.camera, 'stop_acquisition'):
+                        self.camera.stop_acquisition()
+                    
+                    # Wait a bit to ensure clean state
+                    time.sleep(0.1)
+                    
+                    # Start new acquisition
+                    self.camera.start_acquisition()
+                    
+                    # Grab a single frame
+                    frame_list = self.camera.grab(1)
+                    if frame_list:
+                        frame = np.array(frame_list[0])
+                        
+                        # Save the frame
+                        if filename:
+                            self._save_frame_to_folder(frame, filename, self.auto_capture_folder or os.path.join(os.path.expanduser("~"), "Downloads"))
+                            
+                        # Store the frame for potential display
+                        self.last_frame = frame.copy()
+                        return frame
+                    else:
+                        print("Failed to capture frame")
+                        return None
+                        
             except Exception as e:
-                print(f"Error saving to auto-capture folder: {e}")
-                # Try saving to downloads as a fallback
-                self._save_frame_to_downloads(frame, filename)
-        else:
-            # Save to downloads folder
-            self._save_frame_to_downloads(frame, filename)
-        
-        return processed_frame
+                print(f"Error capturing frame: {e}")
+                return None
 
 
 ###############################################################################
@@ -2261,7 +2148,7 @@ class GridDisplayWidget(QLabel):
 
 
 ###############################################################################
-# CameraDisplayWidget with GPU-accelerated rendering and FPS display
+# CameraDisplayWidget 
 ###############################################################################
 class CameraDisplayWidget(QLabel):
     def __init__(self, hardware, parent=None):
@@ -2364,7 +2251,7 @@ class CameraDisplayWidget(QLabel):
 
 
 ###############################################################################
-# ControlPanelWidget with revised Stage Controls (arrow buttons) and updated exposure slider
+# ControlPanelWidget 
 ###############################################################################
 class ControlPanelWidget(QWidget):
     def __init__(self, hardware: MicroscopeHardware, parent=None):
@@ -2497,11 +2384,6 @@ class ControlPanelWidget(QWidget):
         self.exposure_label = QLabel("0.1 s")
         camera_layout.addWidget(self.exposure_label, 0, 2)
         
-        # # Autoexposure checkbox
-        # self.autoexposure_checkbox = QCheckBox("Auto")
-        # self.autoexposure_checkbox.setChecked(False)
-        # self.autoexposure_checkbox.stateChanged.connect(self.autoexposure_toggled)
-        # camera_layout.addWidget(self.autoexposure_checkbox, 0, 3)
         
         # Exposure manual input
         camera_layout.addWidget(QLabel("Exposure (s):"), 1, 0)
@@ -2511,19 +2393,6 @@ class ControlPanelWidget(QWidget):
         self.exposure_input.editingFinished.connect(self.update_exposure_from_text)
         camera_layout.addWidget(self.exposure_input, 1, 1, 1, 2)
         
-        # Target brightness slider (only visible when autoexposure is enabled)
-        # camera_layout.addWidget(QLabel("Target:"), 2, 0)
-        # self.target_slider = QSlider(Qt.Horizontal)
-        # self.target_slider.setRange(10, 90)  # Target brightness (10-90%)
-        # self.target_slider.setValue(50)      # default 50%
-        # self.target_slider.valueChanged.connect(self.update_target_brightness)
-        # self.target_slider.setEnabled(False)  # disabled initially
-        # camera_layout.addWidget(self.target_slider, 2, 1)
-        
-        # Target brightness value label
-        self.target_label = QLabel("50%")
-        camera_layout.addWidget(self.target_label, 2, 2)
-        
         layout.addWidget(camera_group)
         
         # Auto-Capture Controls
@@ -2532,7 +2401,7 @@ class ControlPanelWidget(QWidget):
         capture_group.setLayout(capture_layout)
         
         # Single capture button
-        self.capture_button = QPushButton("Take Photo")
+        self.capture_button = QPushButton("Save Current Photo")
         self.capture_button.clicked.connect(self.save_current_photo_clicked)
         capture_layout.addWidget(self.capture_button, 0, 0, 1, 2)  # span 2 columns
         
@@ -2905,26 +2774,6 @@ class ControlPanelWidget(QWidget):
         """Save current frame"""
         self.hardware.save_last_frame()
         
-    @pyqtSlot(int)
-    def autoexposure_toggled(self, state):
-        """Toggle autoexposure"""
-        enabled = (state == Qt.Checked)
-        
-        # Enable/disable exposure slider and input
-        self.exposure_slider.setEnabled(not enabled)
-        self.exposure_input.setEnabled(not enabled)
-        
-        # Enable/disable target brightness slider
-        self.target_slider.setEnabled(enabled)
-        
-        # Tell hardware
-        self.hardware.set_autoexposure(enabled)
-    
-    def update_target_brightness(self, value):
-        """Update autoexposure target brightness"""
-        self.hardware.autoexposure_target = value
-        self.target_label.setText(f"{value}%")
-    
     def zero_stage(self):
         """Move the Z axis to the absolute zero position for the current optic"""
         reply = QMessageBox.question(
