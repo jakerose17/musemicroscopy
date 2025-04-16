@@ -32,7 +32,7 @@ def detect_duplicates_in_stitched(stitched_path="stitchdetectedindividual.png", 
     
     # Tile size and grid from original color images
     pattern = r'X(\d+\.\d+)_Y(\d+\.\d+)'
-    folder_path = "/Users/alansaj/musemicroscopy/new_images"
+    folder_path = "C:/Users/jrose17/Downloads/AutoCapture_20250416_115249"
     image_files = [f for f in os.listdir(folder_path) if re.search(pattern, f)]
     if not image_files:
         print(f"No images found in {folder_path} to determine size")

@@ -91,13 +91,13 @@ def stitch_original_images_with_blending(folder_path, output_path="stitched_fina
     canvas = np.clip(canvas, 0, 255).astype(np.uint8)  # Convert back to uint8
     
     # Save the stitched image
-    cv2.imwrite(output_path, canvas)
+    cv2.imwrite(os.path.join(folder_path, output_path), canvas)
     print(f"Final blended stitched image saved to {output_path}")
     if np.all(canvas == 0):
         print("Warning: Stitched image is completely black!")
 
 # Main execution
 if __name__ == "__main__":
-    folder_path = "/Users/alansaj/musemicroscopyalan/AutoCapture_20250402_161903/Exported"  # Original images
+    folder_path = "C:/Users/jrose17/Downloads/AutoCapture_20250416_115249"  # Original images
     print("Stitching original images with 50% overlap and blending...")
     stitch_original_images_with_blending(folder_path)

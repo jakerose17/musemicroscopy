@@ -113,7 +113,18 @@ class MotionController:
                 m_config = device.LoadMotorConfiguration(serial_no,
                     DeviceConfiguration.DeviceSettingsUseOptionType.UseFileSettings)
                 m_config.UpdateCurrentConfiguration()
-                device.SetSettings(device.MotorDeviceSettings, True, False)
+                
+                # Set high velocity through motor configuration
+                try:
+                    # Set a high velocity value (in steps/s)
+                    # For KCube DCServo motors, a value of 100000 steps/s is typically safe
+                    velocity = Decimal(100000)
+                    m_config.Velocity = velocity
+                    m_config.UpdateCurrentConfiguration()
+                    device.SetSettings(device.MotorDeviceSettings, True, False)
+                    print(f"[{axis}] Velocity set to {velocity} steps/s")
+                except Exception as e:
+                    print(f"[{axis}] Error setting velocity: {e}")
                 
                 # Check if the device needs to be homed
                 try:
@@ -121,21 +132,15 @@ class MotionController:
                     if device.Status.IsHomed:
                         print(f"[{axis}] Already homed. Current pos: {device.Position}")
                         self.homed_axes.add(axis)
-                    elif device.Position == Decimal(0):
+                    else:
                         print(f"Homing axis {axis} (serial {serial_no})...")
                         try:
-                            # Set a more generous timeout (120 seconds instead of 60)
                             device.Home(120000)
                             print(f"[{axis}] Homing complete.")
                             self.homed_axes.add(axis)
                         except Exception as e:
                             print(f"[{axis}] Error during homing: {e}")
                             print(f"[{axis}] Will need to be homed manually.")
-                    else:
-                        # If position is not 0 but the device isn't marked as homed,
-                        # we'll assume it's already been manually positioned
-                        print(f"[{axis}] Not at home position but has position {device.Position}.")
-                        self.homed_axes.add(axis)
                 except Exception as e:
                     print(f"[{axis}] Error checking homing status: {e}")
                 
@@ -160,26 +165,6 @@ class MotionController:
         
         # Return True if all axes are homed, False otherwise
         return len(self.homed_axes) == len(self.devices)
-
-    def move_axis_relative(self, axis, step_mm):
-        # Check if the axis is homed before allowing movement
-        if axis not in self.homed_axes:
-            print(f"[{axis}] Warning: Moving unhomed axis. Results may be unpredictable.")
-            
-        if axis not in self.devices:
-            print(f"[{axis}] Axis not initialized.")
-            return
-        device = self.devices[axis]
-        try:
-            current_pos = float(str(device.Position))
-        except Exception as e:
-            print(f"[{axis}] Error reading current position: {e}")
-            return
-        new_pos = current_pos + step_mm
-        try:
-            device.MoveTo(Decimal(new_pos), Int32(20000))
-        except Exception as e:
-            print(f"[{axis}] MoveTo command failed: {e}")
 
     def disconnect_all(self):
         for axis, device in self.devices.items():
@@ -217,9 +202,25 @@ class StageMoveWorker(QThread):
         self.step_mm = step_mm
 
     def run(self):
-        self.hardware._move_axis_absolute(self.axis, self.step_mm)
+        self.hardware._move_axis_relative(self.axis, self.step_mm)
         self.finished_move.emit()
 
+class ZeroStageWorker(QThread):
+    finished_move = pyqtSignal()
+    error_occurred = pyqtSignal(str)
+
+    def __init__(self, hardware, parent=None):
+        super().__init__(parent)
+        self.hardware = hardware
+
+    def run(self):
+        try:
+            if self.hardware.zero_stage_at_optic_center():
+                self.finished_move.emit()
+            else:
+                self.error_occurred.emit("Failed to move stage to focus position")
+        except Exception as e:
+            self.error_occurred.emit(f"Error during zeroing: {str(e)}")
 
 ###############################################################################
 # AutoCaptureWorker: Runs an automatic capture sequence in a separate thread.
@@ -265,11 +266,11 @@ class AutoCaptureWorker(QThread):
         current_z = self._get_current_coordinate('Z')
 
         if self.mode == "z":
-            self._run_focus_stack(current_x, current_y, current_z)
+            self._run_focus_stack(current_x, current_y, current_z, folder_name)
         elif self.mode == "xy":
-            self._run_xy_pattern(current_x, current_y, current_z)
+            self._run_xy_pattern(current_x, current_y, current_z, folder_name)
         elif self.mode == "xyz":
-            self._run_combined(current_x, current_y, current_z)
+            self._run_combined(current_x, current_y, current_z, folder_name)
 
         # Ensure LED is turned off after capture
         self.hardware.turn_off_led()
@@ -287,7 +288,7 @@ class AutoCaptureWorker(QThread):
                 return 0.0
         return 0.0
 
-    def _run_focus_stack(self, x, y, z):
+    def _run_focus_stack(self, x, y, z, folder_name):
         if self.num_stack <= 1:
             z_positions = [z]
         else:
@@ -298,15 +299,15 @@ class AutoCaptureWorker(QThread):
         per_capture = self.time_estimates["Focus Stack"]
         for z_target in z_positions:
             self.hardware.move_to_absolute(z=z_target)
-            time.sleep(0.5)
-            self.hardware.capture_image(filename=f"focusstack_X{x:.3f}_Y{y:.3f}_Z{z_target:.3f}.png")
+            time.sleep(0.1)
+            self.hardware.save_last_frame(filename=f"focusstack_X{x:.3f}_Y{y:.3f}_Z{z_target:.3f}.tiff",foldername=folder_name)
             if self.hardware.last_frame is not None:
                 self.new_capture.emit(self.hardware.last_frame)
             completed += 1
             remaining = (total - completed) * per_capture
             self.progress_update.emit(completed, total, remaining)
 
-    def _run_xy_pattern(self, x, y, z):
+    def _run_xy_pattern(self, x, y, z, folder_name):
         fov_x = self.hardware.fov_x
         fov_y = self.hardware.fov_y
         step_x = fov_x * (1 - self.overlap/100.0)
@@ -339,15 +340,15 @@ class AutoCaptureWorker(QThread):
             xs = positions_x if j % 2 == 0 else list(reversed(positions_x))
             for x_target in xs:
                 self.hardware.move_to_absolute(x=x_target, y=y_target)
-                time.sleep(0.5)
-                self.hardware.capture_image(filename=f"xy_X{x_target:.3f}_Y{y_target:.3f}_Z{z:.3f}.png")
+                time.sleep(0.1)
+                self.hardware.save_last_frame(filename=f"xy_X{x_target:.3f}_Y{y_target:.3f}_Z{z:.3f}.tiff",foldername=folder_name)
                 if self.hardware.last_frame is not None:
                     self.new_capture.emit(self.hardware.last_frame)
                 completed += 1
                 remaining = (total - completed) * per_capture
                 self.progress_update.emit(completed, total, remaining)
 
-    def _run_combined(self, x, y, z):
+    def _run_combined(self, x, y, z, folder_name):
         fov_x = self.hardware.fov_x
         fov_y = self.hardware.fov_y
         step_x = fov_x * (1 - self.overlap/100.0)
@@ -385,18 +386,18 @@ class AutoCaptureWorker(QThread):
             xs = positions_x if j % 2 == 0 else list(reversed(positions_x))
             for x_target in xs:
                 self.hardware.move_to_absolute(x=x_target, y=y_target)
-                time.sleep(0.5)
+                time.sleep(0.1)
                 for z_target in z_positions:
                     self.hardware.move_to_absolute(z=z_target)
-                    time.sleep(0.5)
-                    self.hardware.capture_image(filename=f"combined_X{x_target:.3f}_Y{y_target:.3f}_Z{z_target:.3f}.png")
+                    time.sleep(0.1)
+                    self.hardware.save_last_frame(filename=f"combined_X{x_target:.3f}_Y{y_target:.3f}_Z{z_target:.3f}.tiff",foldername=folder_name)
                     if self.hardware.last_frame is not None:
                         self.new_capture.emit(self.hardware.last_frame)
                     completed += 1
                     remaining = (total - completed) * per_capture
                     self.progress_update.emit(completed, total, remaining)
                 self.hardware.move_to_absolute(z=z)
-                time.sleep(0.5)
+                time.sleep(0.1)
 
 ###############################################################################
 # PreviewFieldWorker: Runs a preview scan of the entire field and creates a mosaic
@@ -416,7 +417,7 @@ class PreviewFieldWorker(QThread):
         self.field_max_x = 48  # mm
         self.field_max_y = 48  # mm
         
-        # Create a unique folder for this preview
+        # Create a timestamped folder in Downloads for this preview
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.preview_folder = os.path.join(os.path.expanduser("~"), "Downloads", f"preview_field_{timestamp}")
         os.makedirs(self.preview_folder, exist_ok=True)
@@ -431,7 +432,7 @@ class PreviewFieldWorker(QThread):
             self.hardware.move_to_absolute(z=z_zero)
             
             # Wait for move to complete
-            time.sleep(1)
+            time.sleep(0.1)  # Small delay to ensure position is stable
             
             # Calculate grid positions to cover the entire field
             x_min, x_max, y_min, y_max = self.field_min_x, self.field_max_x, self.field_min_y, self.field_max_y
@@ -469,7 +470,6 @@ class PreviewFieldWorker(QThread):
             
             # Report grid dimensions
             print(f"Preview field: {grid_width}x{grid_height} grid ({total_positions} positions)")
-            print(f"Field coverage: {positions_x[-1] if positions_x else 0}mm x {positions_y[-1] if positions_y else 0}mm")
             
             # Progress tracking
             completed = 0
@@ -493,33 +493,64 @@ class PreviewFieldWorker(QThread):
                     # Move to this position
                     self.hardware.move_to_absolute(x=x_pos, y=y_pos)
                     
-                    # Wait for move to complete
-                    time.sleep(0.5)
+                    # Wait for move to complete and position to stabilize
+                    time.sleep(0.1)
                     
                     # Capture image
                     try:
-                        # Turn on LED for capture
-                        self.hardware.turn_on_led()
-                        
                         # Small delay to stabilize
-                        time.sleep(0.2)
-                        
+                        time.sleep(0.1)
+                        while retry_count < 3:
                         # Take photo - save to our preview folder
                         filename = f"preview_{display_x}_{display_y}.jpg"
                         filepath = os.path.join(self.preview_folder, filename)
                         
-                        # Set a flag for the hardware to use this filepath
-                        self.hardware.current_capture_folder = self.preview_folder
-                        image = self.hardware.capture_image(filename)
-                        
-                        if image is not None:
-                            # Store in grid with flipped Y index to get correct vertical orientation
-                            # This is the key change - we flip the Y index for the grid image storage
-                            flipped_y = grid_height - display_y - 1  # Flip Y for display
-                            grid_images[flipped_y][display_x] = image
+                        with QMutexLocker(self.hardware.camera_lock):
+                            if not self.hardware.camera:
+                                print("[SAVE] No camera available to save!")
+                                return None
                             
-                            # Emit new image for display (with flipped Y)
-                            self.new_preview_image.emit(image, display_x, flipped_y)
+                            # Trigger and get frame
+                            self.hardware.camera.issue_software_trigger()
+                            timeout_ms = 5000
+                            start_time = time.time()
+                            
+                            frame = None
+                            while time.time() - start_time < timeout_ms/1000:
+                                camera_frame = self.hardware.camera.get_pending_frame_or_null()
+                                if camera_frame is not None:
+                                    frame = camera_frame.image_buffer
+                                    break
+                                time.sleep(0.01)
+                            
+                            if frame is None:
+                                print("[SAVE] Failed to capture frame for saving, trying again at current location")
+                                return None
+
+                        # Save the frame
+                        x = self.hardware.motion_controller._get_coordinate('X')
+                        y = self.hardware.motion_controller._get_coordinate('Y')
+                        z = self.hardware.motion_controller._get_coordinate('Z')
+                        self.hardware.save_last_frame(
+                            filename=f"preview_X{x:.3f}_Y{y:.3f}_Z{z:.3f}.tiff",
+                            foldername=self.preview_folder
+                        )
+                        
+                        # Load the saved image
+                        saved_image_path = os.path.join(self.preview_folder, f"preview_X{x:.3f}_Y{y:.3f}_Z{z:.3f}.tiff")
+                        if os.path.exists(saved_image_path):
+                            # Load the saved image
+                            image = cv2.imread(saved_image_path)
+                            if image is not None:
+                                # Convert from BGR to RGB
+                                image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+                                
+                                # Store in grid with flipped Y index to get correct vertical orientation
+                                flipped_y = grid_height - display_y - 1  # Flip Y for display
+                                grid_images[flipped_y][display_x] = image
+                                
+                                # Emit new image for display (with flipped Y)
+                                self.new_preview_image.emit(image, display_x, flipped_y)
                     except Exception as e:
                         print(f"Error capturing image at ({x_pos}, {y_pos}): {e}")
                     
@@ -584,16 +615,6 @@ class PreviewFieldWorker(QThread):
         self.running = False
         self.wait()  # Wait for thread to finish
 
-    def _get_current_coordinate(self, axis):
-        """Get the current position of the specified axis"""
-        device = self.hardware.motion_controller.devices.get(axis, None)
-        if device is not None:
-            try:
-                return float(str(device.Position))
-            except Exception as e:
-                print(f"Error reading {axis} position: {e}")
-                return 0.0
-        return 0.0
 
 
 ###############################################################################
@@ -677,13 +698,6 @@ class CameraWorker(QThread):
                 
                 # Update the last frame time
                 self.hardware.last_frame_time = time.time()
-                
-                # Handle auto-exposure if enabled and it's time to check
-                if self.hardware.autoexposure_enabled:
-                    # Only adjust exposure periodically to allow stabilization
-                    if (current_time - self.last_autoexposure_time) >= self.autoexposure_interval:
-                        self.hardware.adjust_autoexposure()
-                        self.last_autoexposure_time = current_time
                 
                 # Emit the processed frame
                 self.new_frame.emit(processed_frame)
@@ -1444,107 +1458,9 @@ class MicroscopeHardware:
             print(f"Error in frame processing: {e}")
             # Return a gray frame in case of error
             return np.full((480, 640, 3), 128, dtype=np.uint8)
-
-    def analyze_histogram(self, frame):
-        """Analyze image histogram with center-weighted metering"""
-        if frame is None or frame.size == 0:
-            return 128, 0, None
-            
-        # Process the frame first
-        processed_frame = self.process_frame(frame)
-        if processed_frame is None:
-            return 128, 0, None
-            
-        # Convert to grayscale for histogram analysis
-        if len(processed_frame.shape) == 3:
-            gray = cv2.cvtColor(processed_frame, cv2.COLOR_RGB2GRAY)
-        else:
-            gray = processed_frame
-            
-        # Calculate center and edge regions
-        height, width = gray.shape
-        center_h = height // 4
-        center_w = width // 4
-        center_y1 = height // 2 - center_h
-        center_y2 = height // 2 + center_h
-        center_x1 = width // 2 - center_w
-        center_x2 = width // 2 + center_w
-        
-        # Get center region
-        center_region = gray[center_y1:center_y2, center_x1:center_x2]
-        
-        # Create a mask for the edge region
-        edge_mask = np.ones_like(gray, dtype=bool)
-        edge_mask[center_y1:center_y2, center_x1:center_x2] = False
-        edge_region = gray[edge_mask]
-        
-        # Calculate histograms
-        center_hist, _ = np.histogram(center_region, bins=self.histogram_bins, range=(0, 256))
-        edge_hist, _ = np.histogram(edge_region, bins=self.histogram_bins, range=(0, 256))
-        
-        # Weight and combine histograms
-        weighted_hist = (center_hist * self.center_weight + edge_hist * self.edge_weight)
-        
-        # Check if histogram is empty
-        if np.sum(weighted_hist) == 0:
-            return 128, 0, weighted_hist
-            
-        # Calculate mean brightness
-        try:
-            mean_brightness = np.average(np.arange(256), weights=weighted_hist)
-        except ZeroDivisionError:
-            return 128, 0, weighted_hist
-        
-        # Calculate dynamic range
-        non_zero = weighted_hist > 0
-        if np.any(non_zero):
-            min_val = np.min(np.arange(256)[non_zero])
-            max_val = np.max(np.arange(256)[non_zero])
-            dynamic_range = max_val - min_val
-        else:
-            dynamic_range = 0
-            
-        return mean_brightness, dynamic_range, weighted_hist
-        
-    def adjust_autoexposure(self):
-        """Adjust camera exposure based on image brightness"""
-        if not self.camera or self.last_frame is None or self.last_frame.size == 0:
-            return
-            
-        # Process the frame using the proper color handling
-        processed_frame = self.process_frame(self.last_frame)
-        if processed_frame is None:
-            return
-            
-        # Convert to grayscale for brightness analysis
-        gray = cv2.cvtColor(processed_frame, cv2.COLOR_RGB2GRAY)
-        
-        # Calculate mean brightness (0-100%)
-        mean_brightness = (np.mean(gray) / 255.0) * 100.0
-        
-        # Calculate error (target and mean are both 0-100%)
-        error = self.autoexposure_target - mean_brightness
-        
-        # Calculate adjustment based on error
-        # Use exponential mapping for more natural control
-        adjustment = np.exp(error/100.0) - 1
-        
-        # Get current exposure based on camera type
-        if hasattr(self, '_camera_sdk') and self._camera_sdk is not None:
-            # Direct SDK - convert from microseconds to seconds
-            current_exposure = self.camera.exposure_time_us / 1000000.0
-        else:
-            # Pylablib camera
-            current_exposure = self.camera.get_exposure()
-            
-        new_exposure = current_exposure * (1 + adjustment)
-        new_exposure = max(self.autoexposure_min, min(self.autoexposure_max, new_exposure))  # Limit to range
-        
-        # Only adjust if change is significant (>5%)
-        if abs(new_exposure - current_exposure) / current_exposure > 0.05:
-            self.set_exposure(new_exposure)
             
     def move_stage(self, x=None, y=None, z=None):
+        """Move stage by relative amounts in mm"""
         if x is not None:
             worker = StageMoveWorker(self, "X", x)
             worker.finished_move.connect(lambda w=worker: self._cleanup_worker(w))
@@ -1560,12 +1476,23 @@ class MicroscopeHardware:
             worker.finished_move.connect(lambda w=worker: self._cleanup_worker(w))
             self.move_workers.append(worker)
             worker.start()
+        
+        # Wait for all movements to complete
+        self._wait_for_moves_complete()
+
+    def _wait_for_moves_complete(self):
+        """Wait for all move workers to complete"""
+        while self.move_workers:
+            for worker in self.move_workers[:]:  # Create a copy of the list to avoid modification during iteration
+                if not worker.isRunning():
+                    self._cleanup_worker(worker)
+            time.sleep(0.1)  # Small delay to prevent CPU hogging
 
     def _cleanup_worker(self, worker):
         if worker in self.move_workers:
             self.move_workers.remove(worker)
 
-    def _move_axis_absolute(self, axis, step_mm):
+    def _move_axis_relative(self, axis, step_mm):
         if axis not in self.motion_controller.devices:
             print(f"[{axis}] Axis not initialized.")
             return
@@ -1577,54 +1504,43 @@ class MicroscopeHardware:
             return
         new_pos = current_pos + step_mm
         try:
-            device.MoveTo(Decimal(new_pos), Int32(20000))
+            device.MoveTo(Decimal(new_pos), Int32(60000))
         except Exception as e:
             print(f"[{axis}] MoveTo command failed: {e}")
 
-    def move_to_absolute(self, x=None, y=None, z=None):
-        """Move axes to absolute positions in mm"""
-        if x is not None:
-            device = self.motion_controller.devices.get("X")
-            if device is not None:
-                current_x = float(str(device.Position))
-                delta = x - current_x
-                self._move_axis_absolute("X", delta)
-        if y is not None:
-            device = self.motion_controller.devices.get("Y")
-            if device is not None:
-                current_y = float(str(device.Position))
-                delta = y - current_y
-                self._move_axis_absolute("Y", delta)
-        if z is not None:
-            device = self.motion_controller.devices.get("Z")
-            if device is not None:
-                current_z = float(str(device.Position))
-                delta = z - current_z
-                self._move_axis_absolute("Z", delta)
-
-    def get_white_balance_scales(self):
-        """Return the white balance scaling factors"""
-        if hasattr(self, 'white_balance') and self.white_balance is not None:
-            return self.white_balance[0], self.white_balance[1], self.white_balance[2]
-        else:
-            return 1.0, 1.0, 1.0
-
-    def apply_color_matrix(self, rgb_frame):
-        """Apply the color correction matrix to an RGB frame"""
-        if not hasattr(self, 'color_correction_matrix'):
-            return rgb_frame
+    def set_axis_velocity(self, axis, velocity_mm_per_sec):
+        """Set the velocity for a specific axis in mm/s"""
+        if axis not in self.motion_controller.devices:
+            print(f"[{axis}] Axis not initialized.")
+            return False
+        device = self.motion_controller.devices[axis]
+        try:
+            # Convert mm/s to device units (steps/s)
+            steps_per_mm = device.DeviceUnitToReal(1.0)
+            velocity_steps = velocity_mm_per_sec * steps_per_mm
             
-        # Convert to float for matrix multiplication
-        rgb_float = rgb_frame.astype(np.float32) / 255.0
+            # Set the velocity
+            device.SetVelocityParams(Decimal(0), Decimal(velocity_steps), Decimal(0))
+            print(f"[{axis}] Velocity set to {velocity_mm_per_sec} mm/s")
+            return True
+        except Exception as e:
+            print(f"[{axis}] Error setting velocity: {e}")
+            return False
+
+    def move_to_absolute(self, x=None, y=None, z=None):
+        """Move axes to absolute positions in mm using relative movements"""
+        # Get current positions
+        current_x = self.motion_controller._get_coordinate("X") if x is not None else None
+        current_y = self.motion_controller._get_coordinate("Y") if y is not None else None
+        current_z = self.motion_controller._get_coordinate("Z") if z is not None else None
         
-        # Apply color correction matrix
-        corrected = np.zeros_like(rgb_float)
-        for i in range(3):
-            corrected[:,:,i] = (rgb_float * self.color_correction_matrix[i,:].reshape(1,1,3)).sum(axis=2)
+        # Calculate relative movements
+        delta_x = x - current_x if x is not None else None
+        delta_y = y - current_y if y is not None else None
+        delta_z = z - current_z if z is not None else None
         
-        # Clip to valid range and convert back to uint8
-        corrected = np.clip(corrected, 0, 1) * 255
-        return corrected.astype(np.uint8)
+        # Move all axes simultaneously
+        self.move_stage(x=delta_x, y=delta_y, z=delta_z)
 
     def set_optic(self, optic_name):
         """Set the current optic and update related parameters"""
@@ -1645,9 +1561,9 @@ class MicroscopeHardware:
                 target_z = self.z_zero  # This is now an absolute position
                 
                 # Move Z to the absolute position defined for the current optic
-                self.move_to_absolute(z=target_z)
+                self.move_to_absolute(x=16.3,y=19.1,z=target_z)
                 
-                print(f"Moved Z axis to {target_z} mm (zero position for {self.current_optic})")
+                print(f"Moved Z axis to {target_z} mm (zero position for {self.current_optic}) and center stage")
                 return True
             except Exception as e:
                 print(f"Error zeroing stage: {e}")
@@ -1663,18 +1579,18 @@ class MicroscopeHardware:
             return True
         return False
 
-    def save_last_frame(self):
-        """Save the most recently captured frame to the Downloads folder"""
+    def save_last_frame(self, filename, foldername):
+        """Save the most recently captured frame to the foldername with filename"""
         try:
             # Capture a fresh frame
             with QMutexLocker(self.camera_lock):
                 if not self.camera:
                     print("[SAVE] No camera available to save!")
                     return None
-                
+
                 # Trigger and get frame
                 self.camera.issue_software_trigger()
-                timeout_ms = 1000
+                timeout_ms = 5000
                 start_time = time.time()
                 
                 frame = None
@@ -1686,12 +1602,14 @@ class MicroscopeHardware:
                     time.sleep(0.01)
                 
                 if frame is None:
-                    print("[SAVE] Failed to capture frame for saving")
+                    print("[SAVE] Failed to capture frame for saving, trying again at current location")
                     return None
             
             # Create a timestamp for the filename
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            downloads = os.path.join(os.path.expanduser("~"), "Downloads")
+            #timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            #downloads = os.path.join(os.path.expanduser("~"), "Downloads")
+            tiff_filename = filename
+            tiff_path = os.path.join(foldername, tiff_filename)
             
             # Save as 16-bit TIFF
             if self._mono_to_color_processor is not None and self._is_color:
@@ -1723,8 +1641,6 @@ class MicroscopeHardware:
                     scaled = cv2.cvtColor(scaled, cv2.COLOR_RGB2BGR)
                     
                     # Save as 16-bit TIFF
-                    tiff_filename = f"microscope_image_{timestamp}.tiff"
-                    tiff_path = os.path.join(downloads, tiff_filename)
                     cv2.imwrite(tiff_path, scaled)
                     print(f"16-bit image saved to {tiff_path}")
                     return tiff_path
@@ -1734,8 +1650,6 @@ class MicroscopeHardware:
                     return None
             else:
                 # For monochrome cameras, save as 16-bit TIFF
-                tiff_filename = f"microscope_image_{timestamp}.tiff"
-                tiff_path = os.path.join(downloads, tiff_filename)
                 cv2.imwrite(tiff_path, frame.astype(np.uint16))
                 print(f"16-bit monochrome image saved to {tiff_path}")
                 return tiff_path
@@ -1743,151 +1657,6 @@ class MicroscopeHardware:
         except Exception as e:
             print(f"Error saving frame: {e}")
             return None
-
-    def _save_frame_to_folder(self, frame, filename, folder_path):
-        """Save a camera frame to the specified folder"""
-        try:
-            # Full path to save
-            save_path = os.path.join(folder_path, filename)
-            
-            # Check if this is a field view (preview) image
-            is_field_view = "preview" in filename.lower() or "field" in filename.lower()
-            
-            if is_field_view:
-                # For field view, save as 8-bit JPG
-                processed_frame = self.process_frame(frame)
-                if processed_frame.shape[2] == 3:  # If RGB
-                    processed_frame = cv2.cvtColor(processed_frame, cv2.COLOR_RGB2BGR)
-                cv2.imwrite(save_path, processed_frame)
-            else:
-                # For all other images, save as 16-bit TIFF
-                if self._mono_to_color_processor is not None and self._is_color:
-                    width = frame.shape[1]
-                    height = frame.shape[0]
-                    
-                    # Use ThorLabs color processor to transform to 48-bit RGB
-                    color_image_data = self._mono_to_color_processor.transform_to_48(
-                        frame,
-                        width,
-                        height
-                    )
-                    color_image_data = color_image_data.reshape(height, width, 3)
-                    
-                    # Scale to use full 16-bit range
-                    min_val = color_image_data.min()
-                    max_val = color_image_data.max()
-                    if max_val > min_val:
-                        normalized = (color_image_data.astype(np.float32) - min_val) / (max_val - min_val)
-                        scaled = (normalized * 65535).astype(np.uint16)
-                    else:
-                        scaled = color_image_data.astype(np.uint16)
-                    
-                    # Convert RGB to BGR for OpenCV
-                    scaled = cv2.cvtColor(scaled, cv2.COLOR_RGB2BGR)
-                    cv2.imwrite(save_path, scaled)
-                else:
-                    # For monochrome cameras, save as 16-bit TIFF
-                    cv2.imwrite(save_path, frame.astype(np.uint16))
-            
-            print(f"Frame saved to {save_path}")
-            return save_path
-        except Exception as e:
-            print(f"Error saving frame: {e}")
-            return None
-
-    def capture_image(self, filename="captured_image.png"):
-        if not self.camera:
-            print("No camera available for capture!")
-            return None
-        
-        # Turn on LED for capture
-        self.turn_on_led()
-        time.sleep(0.5)  # Let LED brightness stabilize and camera gain adjust
-        
-        # Try to grab a frame based on camera type
-        frame = None
-        
-        # Check if we're using ThorLabs SDK directly
-        if hasattr(self, '_camera_sdk') and self._camera_sdk is not None:
-            # Using ThorLabs SDK
-            max_attempts = 5  # Increased attempts
-            for attempt in range(max_attempts):
-                try:
-                    with QMutexLocker(self.camera_lock):
-                        # Disarm camera to ensure clean state
-                        if hasattr(self.camera, 'disarm'):
-                            self.camera.disarm()
-                        
-                        # Wait a bit to ensure any pending operations are complete
-                        time.sleep(0.1)
-                        
-                        # Re-arm camera for capture
-                        self.camera.arm(2)
-                        self.camera.issue_software_trigger()
-                        
-                        # Wait for frame with timeout
-                        timeout_ms = 1000
-                        start_time = time.time()
-                        
-                        while time.time() - start_time < timeout_ms/1000:
-                            camera_frame = self.camera.get_pending_frame_or_null()
-                            if camera_frame is not None:
-                                frame = camera_frame.image_buffer
-                                break
-                            time.sleep(0.01)
-                        
-                        if frame is not None:
-                            break  # Success
-                            
-                except Exception as e:
-                    print(f"Error capturing frame (attempt {attempt+1}/{max_attempts}): {e}")
-                    time.sleep(0.5)  # Wait between attempts
-                    
-            if frame is None:
-                print("Failed to capture frame after multiple attempts")
-                return None
-                
-            # Save the frame
-            if filename:
-                self._save_frame_to_folder(frame, filename, self.auto_capture_folder or os.path.join(os.path.expanduser("~"), "Downloads"))
-                
-            # Store the frame for potential display
-            self.last_frame = frame.copy()
-            return frame
-            
-        else:
-            # Using pylablib
-            try:
-                with QMutexLocker(self.camera_lock):
-                    # Stop any ongoing acquisition
-                    if hasattr(self.camera, 'stop_acquisition'):
-                        self.camera.stop_acquisition()
-                    
-                    # Wait a bit to ensure clean state
-                    time.sleep(0.1)
-                    
-                    # Start new acquisition
-                    self.camera.start_acquisition()
-                    
-                    # Grab a single frame
-                    frame_list = self.camera.grab(1)
-                    if frame_list:
-                        frame = np.array(frame_list[0])
-                        
-                        # Save the frame
-                        if filename:
-                            self._save_frame_to_folder(frame, filename, self.auto_capture_folder or os.path.join(os.path.expanduser("~"), "Downloads"))
-                            
-                        # Store the frame for potential display
-                        self.last_frame = frame.copy()
-                        return frame
-                    else:
-                        print("Failed to capture frame")
-                        return None
-                        
-            except Exception as e:
-                print(f"Error capturing frame: {e}")
-                return None
 
 
 ###############################################################################
@@ -1911,7 +1680,7 @@ class GridDisplayWidget(QLabel):
         self.cell_height = 0
         
         # Display options
-        self.show_mosaic = False
+        self.show_mosaic = True  # Always show mosaic
         self.mosaic_image = None
         
         # Current position indicator (green box)
@@ -1933,7 +1702,6 @@ class GridDisplayWidget(QLabel):
         if self.grid_width > 0 and self.grid_height > 0:
             self.grid_images = [[None for _ in range(self.grid_width)] for _ in range(self.grid_height)]
             self.mosaic_image = None
-            self.show_mosaic = False
             self.update()
             
     def add_image(self, image, grid_x, grid_y):
@@ -1945,13 +1713,10 @@ class GridDisplayWidget(QLabel):
     def set_mosaic(self, mosaic):
         """Set the full stitched mosaic image"""
         self.mosaic_image = mosaic
+        self.show_mosaic = True  # Always show mosaic
         self.update()
         
-    def toggle_mosaic_view(self):
-        """Toggle between grid view and mosaic view"""
-        if self.mosaic_image is not None:
-            self.show_mosaic = not self.show_mosaic
-            self.update()
+  
     
     def update_current_position(self, x_mm, y_mm, optic_name=None):
         """Update the current position indicator"""
@@ -2122,9 +1887,17 @@ class GridDisplayWidget(QLabel):
                 if self.grid_images[y][x] is not None:
                     # Cell has an image
                     img = self.grid_images[y][x]
-                    height, width, channel = img.shape
-                    bytes_per_line = 3 * width
-                    q_img = QImage(img.data, width, height, bytes_per_line, QImage.Format_RGB888)
+                    if len(img.shape) == 3:  # Color image
+                        height, width, channel = img.shape
+                        bytes_per_line = 3 * width
+                        q_img = QImage(img.data, width, height, bytes_per_line, QImage.Format_RGB888)
+                    else:  # Monochrome image
+                        height, width = img.shape
+                        # Convert to RGB by repeating the monochrome channel
+                        rgb_img = np.stack((img,) * 3, axis=-1)
+                        bytes_per_line = 3 * width
+                        q_img = QImage(rgb_img.data, width, height, bytes_per_line, QImage.Format_RGB888)
+                    
                     pixmap = QPixmap.fromImage(q_img)
                     scaled_pixmap = pixmap.scaled(
                         int(cell_width), int(cell_height), 
@@ -2568,26 +2341,22 @@ class ControlPanelWidget(QWidget):
     
     def led_selection_changed(self):
         """Handle LED selection change"""
-        if self.led_combo.currentText() == "None":
-            self.led_enable.setEnabled(False)
-            self.led_slider.setEnabled(False)
-            self.led_intensity_input.setEnabled(False)
-            # Turn off any active LED
+        # Turn off current LED before switching
+        if self.led_enable.isChecked():
             self.hardware.turn_off_led()
+            self.led_enable.setChecked(False)  # Ensure checkbox is unchecked
+        
+        # Connect to new LED
+        requested_led_type = self.led_combo.currentText()
+        if requested_led_type == "None":
+            self._update_led_ui_state()
             return
             
-        self.led_enable.setEnabled(True)
-        self.led_slider.setEnabled(True)
-        self.led_intensity_input.setEnabled(True)
-        
-        # Connect to the selected LED type
-        led_type = self.led_combo.currentText()
-        if led_type in self.hardware.led_controllers:
-            # Switch to the selected LED
-            self.hardware.connect_led(led_type)
-            
-            # Update the slider based on the current intensity
-            self.update_led_slider_from_intensity()
+        if self.hardware.connect_led(requested_led_type):
+            self._update_led_ui_state()
+        else:
+            QMessageBox.warning(self, "LED Connection Error", 
+                              f"Failed to connect to {requested_led_type} LED")
     
     @pyqtSlot(int)
     def led_enable_toggled(self, state):
@@ -2772,23 +2541,45 @@ class ControlPanelWidget(QWidget):
     
     def save_current_photo_clicked(self):
         """Save current frame"""
-        self.hardware.save_last_frame()
-        
+        x = self.hardware.motion_controller._get_coordinate('X')
+        y = self.hardware.motion_controller._get_coordinate('Y')
+        z = self.hardware.motion_controller._get_coordinate('Z')
+        self.hardware.save_last_frame(
+            filename=f"capture_current_X{x:.3f}_Y{y:.3f}_Z{z:.3f}.tiff",
+            foldername=os.path.join(os.path.expanduser("~"), "Downloads")
+        )
+    
     def zero_stage(self):
         """Move the Z axis to the absolute zero position for the current optic"""
-        reply = QMessageBox.question(
-            self, "Zero Stage",
-            f"Move to Z focus position for {self.optic_combo.currentText()} optic?",
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
-        )
-        
-        if reply == QMessageBox.Yes:
-            # Move the stage to the optic's focus position
-            if self.hardware.zero_stage_at_optic_center():
-                print(f"Stage moved to focus position for {self.optic_combo.currentText()} optic")
-                self.update_coordinates()
-            else:
-                print("Failed to move stage to focus position")
+        # Create and start the worker thread
+        self.zero_worker = ZeroStageWorker(self.hardware, self)
+        self.zero_worker.finished_move.connect(self._on_zero_complete)
+        self.zero_worker.error_occurred.connect(self._on_zero_error)
+        self.zero_worker.start()
+
+    def _on_zero_complete(self):
+        """Handle successful completion of zeroing"""
+        print(f"Stage moved to focus position for {self.optic_combo.currentText()} optic")
+        self.update_coordinates()
+
+    def _on_zero_error(self, error_message):
+        """Handle errors during zeroing"""
+        print(error_message)
+        QMessageBox.warning(self, "Zero Stage Error", error_message)
+
+    def _update_led_ui_state(self):
+        """Update the LED UI elements based on the current LED state"""
+        if self.led_combo.currentText() == "None":
+            self.led_enable.setEnabled(False)
+            self.led_slider.setEnabled(False)
+            self.led_intensity_input.setEnabled(False)
+            self.led_enable.setChecked(False)
+        else:
+            self.led_enable.setEnabled(True)
+            self.led_slider.setEnabled(True)
+            self.led_intensity_input.setEnabled(True)
+            # Update the slider based on the current intensity
+            self.update_led_slider_from_intensity()
 
 
 ###############################################################################
@@ -3093,11 +2884,7 @@ class MainWindow(QMainWindow):
         # Update UI
         self.preview_button.setEnabled(True)
         self.statusBar().showMessage("Preview field scan completed")
-        
-        # Add a toggle button to switch between grid and mosaic views
-        toggle_button = QPushButton("Toggle Grid/Mosaic")
-        toggle_button.clicked.connect(self.toggle_mosaic_view)
-        self.statusBar().addPermanentWidget(toggle_button)
+
     
     def toggle_mosaic_view(self):
         """Toggle between grid view and mosaic view in the preview display"""
