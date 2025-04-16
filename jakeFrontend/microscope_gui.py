@@ -7,6 +7,8 @@ import json
 from datetime import datetime
 import traceback
 import math
+import re
+import stitch_backend
 
 from ctypes import cdll, c_uint32, c_int, c_double, c_char_p, byref, create_string_buffer
 from enum import Enum
@@ -245,7 +247,7 @@ class AutoCaptureWorker(QThread):
             "XY Pattern": 7.0,
             "Combined": 5.1
         }
-
+        
     def run(self):
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         downloads = os.path.join(os.path.expanduser("~"), "Downloads")
@@ -360,6 +362,8 @@ class AutoCaptureWorker(QThread):
                 completed += 1
                 remaining = (total - completed) * per_capture
                 self.progress_update.emit(completed, total, remaining)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        stitch_backend.stitch_original_images(folder_name, file_name=f"stitched_xy_Z{z:.3f}_{timestamp}.png", input_overlap_percent=self.overlap)
 
     def _run_combined(self, x, y, z, folder_name):
         positions_x, positions_y = self._return_pattern_coordinates(x, y)
@@ -388,6 +392,8 @@ class AutoCaptureWorker(QThread):
                     self.progress_update.emit(completed, total, remaining)
                 self.hardware.move_to_absolute(z=z, wait_for_completion=True)
                 time.sleep(0.1)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        stitch_backend.stitch_original_images(folder_name, file_name=f"stitched_xyz_Z{z:.3f}_{timestamp}.png", input_overlap_percent=self.overlap)
 
 ###############################################################################
 # PreviewFieldWorker: Runs a preview scan of the entire field and creates a mosaic
