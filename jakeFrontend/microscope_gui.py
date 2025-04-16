@@ -298,7 +298,7 @@ class AutoCaptureWorker(QThread):
         completed = 0
         per_capture = self.time_estimates["Focus Stack"]
         for z_target in z_positions:
-            self.hardware.move_to_absolute(z=z_target)
+            self.hardware.move_to_absolute(z=z_target, wait_for_completion=True)
             time.sleep(0.1)
             self.hardware.save_last_frame(filename=f"focusstack_X{x:.3f}_Y{y:.3f}_Z{z_target:.3f}.tiff",foldername=folder_name)
             if self.hardware.last_frame is not None:
@@ -307,31 +307,44 @@ class AutoCaptureWorker(QThread):
             remaining = (total - completed) * per_capture
             self.progress_update.emit(completed, total, remaining)
 
-    def _run_xy_pattern(self, x, y, z, folder_name):
-        fov_x = self.hardware.fov_x
-        fov_y = self.hardware.fov_y
+    def _return_pattern_coordinates(self, x, y, fov_x=None, fov_y=None):
+        """Calculate grid positions for pattern capture.
+        
+        Args:
+            x (float): Center X coordinate
+            y (float): Center Y coordinate
+            
+        Returns:
+            tuple: (list of X positions, list of Y positions)
+        """
+        # Get field of view and calculate step sizes
+        if fov_x is None:
+            fov_x = self.hardware.fov_x
+        if fov_y is None:
+            fov_y = self.hardware.fov_y
         step_x = fov_x * (1 - self.overlap/100.0)
         step_y = fov_y * (1 - self.overlap/100.0)
         
-        # Calculate positions to cover the defined grid area (pattern_size_x/y is now in mm)
-        half_width = self.pattern_size_x / 2.0
-        half_height = self.pattern_size_y / 2.0
-        start_x = x - half_width
-        end_x = x + half_width
-        start_y = y - half_height
-        end_y = y + half_height
+        # Calculate number of positions needed
+        count_x = int(np.ceil(self.pattern_size_x / step_x))
+        count_y = int(np.ceil(self.pattern_size_y / step_y))
         
-        positions_x = []
-        pos = start_x
-        while pos <= end_x:
-            positions_x.append(pos)
-            pos += step_x
+        # Calculate total pattern size
+        total_width = step_x * (count_x - 1)
+        total_height = step_y * (count_y - 1)
         
-        positions_y = []
-        pos = start_y
-        while pos <= end_y:
-            positions_y.append(pos)
-            pos += step_y
+        # Calculate starting positions (centered on x,y)
+        start_x = x - total_width/2
+        start_y = y - total_height/2
+        
+        # Generate position lists
+        positions_x = [start_x + i * step_x for i in range(count_x)]
+        positions_y = [start_y + i * step_y for i in range(count_y)]
+        
+        return positions_x, positions_y
+
+    def _run_xy_pattern(self, x, y, z, folder_name):
+        positions_x, positions_y = self._return_pattern_coordinates(x, y)
 
         total = len(positions_x) * len(positions_y)
         completed = 0
@@ -339,7 +352,7 @@ class AutoCaptureWorker(QThread):
         for j, y_target in enumerate(positions_y):
             xs = positions_x if j % 2 == 0 else list(reversed(positions_x))
             for x_target in xs:
-                self.hardware.move_to_absolute(x=x_target, y=y_target)
+                self.hardware.move_to_absolute(x=x_target, y=y_target, wait_for_completion=True)
                 time.sleep(0.1)
                 self.hardware.save_last_frame(filename=f"xy_X{x_target:.3f}_Y{y_target:.3f}_Z{z:.3f}.tiff",foldername=folder_name)
                 if self.hardware.last_frame is not None:
@@ -349,30 +362,7 @@ class AutoCaptureWorker(QThread):
                 self.progress_update.emit(completed, total, remaining)
 
     def _run_combined(self, x, y, z, folder_name):
-        fov_x = self.hardware.fov_x
-        fov_y = self.hardware.fov_y
-        step_x = fov_x * (1 - self.overlap/100.0)
-        step_y = fov_y * (1 - self.overlap/100.0)
-        
-        # Calculate positions to cover the defined grid area (pattern_size_x/y is now in mm)
-        half_width = self.pattern_size_x / 2.0
-        half_height = self.pattern_size_y / 2.0
-        start_x = x - half_width
-        end_x = x + half_width
-        start_y = y - half_height
-        end_y = y + half_height
-        
-        positions_x = []
-        pos = start_x
-        while pos <= end_x:
-            positions_x.append(pos)
-            pos += step_x
-        
-        positions_y = []
-        pos = start_y
-        while pos <= end_y:
-            positions_y.append(pos)
-            pos += step_y
+        positions_x, positions_y = self._return_pattern_coordinates(x, y)
 
         if self.num_stack <= 1:
             z_positions = [z]
@@ -385,10 +375,10 @@ class AutoCaptureWorker(QThread):
         for j, y_target in enumerate(positions_y):
             xs = positions_x if j % 2 == 0 else list(reversed(positions_x))
             for x_target in xs:
-                self.hardware.move_to_absolute(x=x_target, y=y_target)
+                self.hardware.move_to_absolute(x=x_target, y=y_target, wait_for_completion=True)
                 time.sleep(0.1)
                 for z_target in z_positions:
-                    self.hardware.move_to_absolute(z=z_target)
+                    self.hardware.move_to_absolute(z=z_target, wait_for_completion=True)
                     time.sleep(0.1)
                     self.hardware.save_last_frame(filename=f"combined_X{x_target:.3f}_Y{y_target:.3f}_Z{z_target:.3f}.tiff",foldername=folder_name)
                     if self.hardware.last_frame is not None:
@@ -396,7 +386,7 @@ class AutoCaptureWorker(QThread):
                     completed += 1
                     remaining = (total - completed) * per_capture
                     self.progress_update.emit(completed, total, remaining)
-                self.hardware.move_to_absolute(z=z)
+                self.hardware.move_to_absolute(z=z, wait_for_completion=True)
                 time.sleep(0.1)
 
 ###############################################################################
@@ -412,10 +402,6 @@ class PreviewFieldWorker(QThread):
         self.hardware = hardware
         self.running = True
         self.overlap_percent = overlap_percent
-        self.field_min_x = 0
-        self.field_min_y = 0
-        self.field_max_x = 48  # mm
-        self.field_max_y = 48  # mm
         
         # Create a timestamped folder in Downloads for this preview
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -429,36 +415,37 @@ class PreviewFieldWorker(QThread):
             # First move to zero height for the current optic
             z_zero = self.hardware.z_zero_positions.get(self.hardware.current_optic, 0)
             print(f"Moving to Z = {z_zero} mm (zero height for {self.hardware.current_optic})")
-            self.hardware.move_to_absolute(z=z_zero)
+            self.hardware.move_to_absolute(z=z_zero, wait_for_completion=True)
             
-            # Wait for move to complete
-            time.sleep(0.1)  # Small delay to ensure position is stable
+            fov_x = self.hardware.fov_x
+            fov_y = self.hardware.fov_y
+            step_x = fov_x * (1 - self.overlap_percent/100.0)
+            step_y = fov_y * (1 - self.overlap_percent/100.0)
             
-            # Calculate grid positions to cover the entire field
-            x_min, x_max, y_min, y_max = self.field_min_x, self.field_max_x, self.field_min_y, self.field_max_y
-            positions_x = []
-            x_pos = x_min
+            # Calculate number of positions needed
+            count_x = int(np.ceil((self.hardware.max_slide_x-fov_x)/fov_x))
+            count_y = int(np.ceil((self.hardware.max_slide_y-fov_y)/fov_y))
+            
+            # Calculate total pattern size
+            total_width = step_x * (count_x - 1)
+            total_height = step_y * (count_y - 1)
+            
+            # Calculate starting positions (centered on x,y)
+            start_x = self.hardware.motion_stage_center_x - total_width/2 if self.hardware.motion_stage_center_x - total_width/2 > self.hardware.motion_stage_min_x else self.hardware.motion_stage_min_x
+            start_y = self.hardware.motion_stage_center_y - total_height/2 if self.hardware.motion_stage_center_y - total_height/2 > self.hardware.motion_stage_min_y else self.hardware.motion_stage_min_y
+            
+            # Generate position lists
+            positions_x = [start_x + i * step_x for i in range(count_x)]
+            positions_y = [start_y + i * step_y for i in range(count_y)]
+
+            print(positions_x)
+            print(positions_y)
+
             
             # Use hardware's actual FOV values
-            fov_width = self.hardware.fov_x
-            fov_height = self.hardware.fov_y
-            print(f"Using FOV from hardware: {fov_width}mm x {fov_height}mm for {self.hardware.current_optic}")
-            
-            # Calculate step size with overlap
-            overlap_factor = self.overlap_percent / 100.0
-            step_x = fov_width * (1 - overlap_factor)
-            step_y = fov_height * (1 - overlap_factor)
-            
-            # Calculate positions
-            while x_pos <= x_max:
-                positions_x.append(x_pos)
-                x_pos += step_x
+            print(f"Using FOV from hardware: {fov_x}mm x {fov_y}mm for {self.hardware.current_optic}")
+
                 
-            positions_y = []
-            y_pos = y_min
-            while y_pos <= y_max:
-                positions_y.append(y_pos)
-                y_pos += step_y
             
             # Define grid dimensions
             grid_width = len(positions_x)
@@ -491,7 +478,7 @@ class PreviewFieldWorker(QThread):
                     display_x = i if j % 2 == 0 else grid_width - i - 1
                     
                     # Move to this position
-                    self.hardware.move_to_absolute(x=x_pos, y=y_pos)
+                    self.hardware.move_to_absolute(x=x_pos, y=y_pos, wait_for_completion=True)
                     
                     # Wait for move to complete and position to stabilize
                     time.sleep(0.1)
@@ -500,7 +487,6 @@ class PreviewFieldWorker(QThread):
                     try:
                         # Small delay to stabilize
                         time.sleep(0.1)
-                        while retry_count < 3:
                         # Take photo - save to our preview folder
                         filename = f"preview_{display_x}_{display_y}.jpg"
                         filepath = os.path.join(self.preview_folder, filename)
@@ -757,6 +743,14 @@ class MicroscopeHardware:
                 "z_zero": 8.6,  # Z zero position in mm (absolute)
             }
         }
+
+        self.motion_stage_center_x = 16.3
+        self.motion_stage_center_y = 19.1
+
+        self.motion_stage_min_x = 0.0
+        self.motion_stage_min_y = 0.0
+        self.motion_stage_max_x = 48.0
+        self.motion_stage_max_y = 48.0
         
         # Default to 4X optic
         self.current_optic = "4X"
@@ -771,7 +765,7 @@ class MicroscopeHardware:
         self.z_zero = self.z_zero_positions["4X"]  # For backward compatibility
         
         self.max_slide_x = 50.0  # mm
-        self.max_slide_y = 50.0  # mm
+        self.max_slide_y = 51.0  # mm
         self.auto_capture_in_progress = False
         self.auto_capture_folder = None
         
@@ -790,23 +784,6 @@ class MicroscopeHardware:
         # LED controller configuration
         self.led_controllers = {}  # Dictionary to store LED controller info
         self.config_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "led_config.json")
-        
-        # Autoexposure parameters
-        self.autoexposure_enabled = False
-        self.autoexposure_target = 50  # Target mean brightness (0-100%)
-        self.autoexposure_tolerance = 5  # Acceptable deviation from target
-        self.autoexposure_min = 0.001  # Minimum exposure time (seconds)
-        self.autoexposure_max = 2.0    # Maximum exposure time (seconds) - increased from 1.0 to 2.0
-        self.autoexposure_step = 0.05  # Adjustment step size factor
-        self.current_exposure = 0.1    # Current exposure value in seconds
-        self.autoexposure_cooldown = 0 # Frames to wait before next adjustment
-        
-        # PID controller parameters for smooth exposure adjustment
-        self.pid_kp = 0.3
-        self.pid_ki = 0.1
-        self.pid_kd = 0.05
-        self.pid_integral = 0
-        self.pid_prev_error = 0
         
         # Initialize hardware in a specific order
         self._init_led_lib()
@@ -1395,10 +1372,6 @@ class MicroscopeHardware:
             except Exception as e:
                 print(f"ERROR setting exposure: {e}")
             
-    def set_autoexposure(self, enabled):
-        """Enable or disable autoexposure"""
-        self.autoexposure_enabled = enabled
-        print(f"Autoexposure {'enabled' if enabled else 'disabled'}")
         
     def process_frame(self, frame):
         """Process a frame from the camera for display using ThorLabs SDK or fallback processing"""
@@ -1459,7 +1432,7 @@ class MicroscopeHardware:
             # Return a gray frame in case of error
             return np.full((480, 640, 3), 128, dtype=np.uint8)
             
-    def move_stage(self, x=None, y=None, z=None):
+    def move_stage(self, x=None, y=None, z=None, wait_for_completion=True):
         """Move stage by relative amounts in mm"""
         if x is not None:
             worker = StageMoveWorker(self, "X", x)
@@ -1478,7 +1451,8 @@ class MicroscopeHardware:
             worker.start()
         
         # Wait for all movements to complete
-        self._wait_for_moves_complete()
+        if wait_for_completion:
+            self._wait_for_moves_complete()
 
     def _wait_for_moves_complete(self):
         """Wait for all move workers to complete"""
@@ -1508,26 +1482,7 @@ class MicroscopeHardware:
         except Exception as e:
             print(f"[{axis}] MoveTo command failed: {e}")
 
-    def set_axis_velocity(self, axis, velocity_mm_per_sec):
-        """Set the velocity for a specific axis in mm/s"""
-        if axis not in self.motion_controller.devices:
-            print(f"[{axis}] Axis not initialized.")
-            return False
-        device = self.motion_controller.devices[axis]
-        try:
-            # Convert mm/s to device units (steps/s)
-            steps_per_mm = device.DeviceUnitToReal(1.0)
-            velocity_steps = velocity_mm_per_sec * steps_per_mm
-            
-            # Set the velocity
-            device.SetVelocityParams(Decimal(0), Decimal(velocity_steps), Decimal(0))
-            print(f"[{axis}] Velocity set to {velocity_mm_per_sec} mm/s")
-            return True
-        except Exception as e:
-            print(f"[{axis}] Error setting velocity: {e}")
-            return False
-
-    def move_to_absolute(self, x=None, y=None, z=None):
+    def move_to_absolute(self, x=None, y=None, z=None, wait_for_completion=True):
         """Move axes to absolute positions in mm using relative movements"""
         # Get current positions
         current_x = self.motion_controller._get_coordinate("X") if x is not None else None
@@ -1540,7 +1495,7 @@ class MicroscopeHardware:
         delta_z = z - current_z if z is not None else None
         
         # Move all axes simultaneously
-        self.move_stage(x=delta_x, y=delta_y, z=delta_z)
+        self.move_stage(x=delta_x, y=delta_y, z=delta_z, wait_for_completion=wait_for_completion)
 
     def set_optic(self, optic_name):
         """Set the current optic and update related parameters"""
@@ -1561,7 +1516,7 @@ class MicroscopeHardware:
                 target_z = self.z_zero  # This is now an absolute position
                 
                 # Move Z to the absolute position defined for the current optic
-                self.move_to_absolute(x=16.3,y=19.1,z=target_z)
+                self.move_to_absolute(x=self.motion_stage_center_x,y=self.motion_stage_center_y,z=target_z, wait_for_completion=False)
                 
                 print(f"Moved Z axis to {target_z} mm (zero position for {self.current_optic}) and center stage")
                 return True
@@ -1588,26 +1543,45 @@ class MicroscopeHardware:
                     print("[SAVE] No camera available to save!")
                     return None
 
-                # Trigger and get frame
-                self.camera.issue_software_trigger()
-                timeout_ms = 5000
-                start_time = time.time()
+                # Calculate total frame time (exposure + readout)
+                exposure_time_us = self.camera.exposure_time_us
+                readout_time_ns = self.camera.sensor_readout_time_ns
+                total_frame_time_sec = (exposure_time_us / 1000000.0) + (readout_time_ns / 1000000000.0)
                 
+                # Add a small safety margin
+                total_frame_time_sec += 0.1  # Add 100ms margin
+                
+                # Try up to 3 times to capture a frame
+                max_attempts = 3
                 frame = None
-                while time.time() - start_time < timeout_ms/1000:
-                    camera_frame = self.camera.get_pending_frame_or_null()
-                    if camera_frame is not None:
-                        frame = camera_frame.image_buffer
-                        break
-                    time.sleep(0.01)
+                
+                for attempt in range(max_attempts):
+                    # Trigger and wait for complete frame
+                    self.camera.issue_software_trigger()
+                    time.sleep(total_frame_time_sec)  # Wait for frame to complete
+                    
+                    # Try to get the frame
+                    timeout_ms = 5000
+                    start_time = time.time()
+                    
+                    while time.time() - start_time < timeout_ms/1000:
+                        camera_frame = self.camera.get_pending_frame_or_null()
+                        if camera_frame is not None:
+                            frame = camera_frame.image_buffer
+                            break
+                        time.sleep(0.01)
+                    
+                    if frame is not None:
+                        break  # Success, exit the retry loop
+                    
+                    print(f"[SAVE] Attempt {attempt + 1}/{max_attempts} failed to capture frame, trying again...")
+                    time.sleep(0.5)  # Brief pause between attempts
                 
                 if frame is None:
-                    print("[SAVE] Failed to capture frame for saving, trying again at current location")
+                    print("[SAVE] Failed to capture frame after 3 attempts")
                     return None
             
             # Create a timestamp for the filename
-            #timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            #downloads = os.path.join(os.path.expanduser("~"), "Downloads")
             tiff_filename = filename
             tiff_path = os.path.join(foldername, tiff_filename)
             
@@ -1666,8 +1640,9 @@ class GridDisplayWidget(QLabel):
     # Define signals
     move_to_position = pyqtSignal(float, float)
     
-    def __init__(self, parent=None):
+    def __init__(self, hardware, parent=None):
         super().__init__(parent)
+        self.hardware = hardware
         self.setMinimumSize(640, 480)
         self.setAlignment(Qt.AlignCenter)
         self.setStyleSheet("background-color: black;")
@@ -1687,8 +1662,8 @@ class GridDisplayWidget(QLabel):
         self.current_x = -1  # mm
         self.current_y = -1  # mm
         self.show_current_position = False
-        self.current_fov_width = 5.0  # mm for 4X optic by default
-        self.current_fov_height = 4.0  # mm for 4X optic by default
+        self.current_fov_width = 12.0  # mm for 4X optic by default
+        self.current_fov_height = 10.0  # mm for 4X optic by default
         
     def setup_grid(self, width, height):
         """Initialize the grid dimensions"""
@@ -1724,20 +1699,16 @@ class GridDisplayWidget(QLabel):
             self.current_optic = optic_name
             
         # Calculate the total field of view including camera FOV
-        if self.current_optic == "4X":
-            fov_x = 12.0  # mm
-            fov_y = 10.0  # mm
-        else:  # 10X
-            fov_x = 4.8   # mm
-            fov_y = 4.0   # mm
-            
-        # Calculate total field size including camera FOV
-        total_field_x = 48.0 + fov_x  # Total field width
-        total_field_y = 48.0 + fov_y  # Total field height
+        fov_x = self.hardware.fov_x
+        fov_y = self.hardware.fov_y
+        
+        # Calculate total field size based on grid dimensions
+        total_field_x = self.grid_width * fov_x
+        total_field_y = self.grid_height * fov_y
         
         # Calculate position as percentage of total field
         x_percent = x_mm / total_field_x
-        y_percent = y_mm / total_field_y
+        y_percent = 1.0 - (y_mm / total_field_y)  # Invert y-axis
         
         # Calculate box size as percentage of total field
         box_width_percent = fov_x / total_field_x
@@ -1748,6 +1719,9 @@ class GridDisplayWidget(QLabel):
         self.current_y = y_percent
         self.current_box_width = box_width_percent
         self.current_box_height = box_height_percent
+        
+        # Show the current position indicator
+        self.show_current_position = True
         
         # Update the display
         self.update()
@@ -1777,7 +1751,7 @@ class GridDisplayWidget(QLabel):
             
         # Get click position as percentage of widget size
         click_x = event.x() / self.width()
-        click_y = event.y() / self.height()
+        click_y = 1.0 - (event.y() / self.height())  # Invert y-axis
         
         # Calculate the total field of view including camera FOV
         if self.current_optic == "4X":
@@ -1998,7 +1972,7 @@ class CameraDisplayWidget(QLabel):
         move_x = delta_pixels_x * mm_per_pixel_x
         move_y = -delta_pixels_y * mm_per_pixel_y
         print(f"Click at image coords: ({image_x:.2f}, {image_y:.2f}); Pixel delta: ({delta_pixels_x:.2f}, {delta_pixels_y:.2f}); Moving stage by: ({move_x:.3f} mm, {move_y:.3f} mm)")
-        self.hardware.move_stage(x=move_x, y=move_y)
+        self.hardware.move_stage(x=move_x, y=move_y, wait_for_completion=False)
         
     
     
@@ -2044,11 +2018,11 @@ class ControlPanelWidget(QWidget):
         stage_layout.addWidget(self.x_coord_label, 0, 1)
         
         x_neg_button = QPushButton("◄")
-        x_neg_button.clicked.connect(lambda: self.hardware.move_stage(x=-self.step_value(), y=None, z=None))
+        x_neg_button.clicked.connect(lambda: self.hardware.move_stage(x=-self.step_value(), y=None, z=None, wait_for_completion=False))
         stage_layout.addWidget(x_neg_button, 0, 2)
         
         x_pos_button = QPushButton("►")
-        x_pos_button.clicked.connect(lambda: self.hardware.move_stage(x=self.step_value(), y=None, z=None))
+        x_pos_button.clicked.connect(lambda: self.hardware.move_stage(x=self.step_value(), y=None, z=None, wait_for_completion=False))
         stage_layout.addWidget(x_pos_button, 0, 3)
         
         # Y-axis controls
@@ -2057,11 +2031,11 @@ class ControlPanelWidget(QWidget):
         stage_layout.addWidget(self.y_coord_label, 1, 1)
         
         y_neg_button = QPushButton("▼")
-        y_neg_button.clicked.connect(lambda: self.hardware.move_stage(x=None, y=-self.step_value(), z=None))
+        y_neg_button.clicked.connect(lambda: self.hardware.move_stage(x=None, y=-self.step_value(), z=None, wait_for_completion=False))
         stage_layout.addWidget(y_neg_button, 1, 2)
         
         y_pos_button = QPushButton("▲")
-        y_pos_button.clicked.connect(lambda: self.hardware.move_stage(x=None, y=self.step_value(), z=None))
+        y_pos_button.clicked.connect(lambda: self.hardware.move_stage(x=None, y=self.step_value(), z=None, wait_for_completion=False))
         stage_layout.addWidget(y_pos_button, 1, 3)
         
         # Z-axis controls
@@ -2070,11 +2044,11 @@ class ControlPanelWidget(QWidget):
         stage_layout.addWidget(self.z_coord_label, 2, 1)
         
         z_neg_button = QPushButton("▼")
-        z_neg_button.clicked.connect(lambda: self.hardware.move_stage(x=None, y=None, z=-self.step_value()))
+        z_neg_button.clicked.connect(lambda: self.hardware.move_stage(x=None, y=None, z=-self.step_value(), wait_for_completion=False))
         stage_layout.addWidget(z_neg_button, 2, 2)
         
         z_pos_button = QPushButton("▲")
-        z_pos_button.clicked.connect(lambda: self.hardware.move_stage(x=None, y=None, z=self.step_value()))
+        z_pos_button.clicked.connect(lambda: self.hardware.move_stage(x=None, y=None, z=self.step_value(), wait_for_completion=False))
         stage_layout.addWidget(z_pos_button, 2, 3)
         
         # Step size
@@ -2623,7 +2597,7 @@ class MainWindow(QMainWindow):
         self.tab_widget.addTab(self.camera_display, "Live View")
         
         # Create grid display widget (for Preview Field tab)
-        self.grid_display = GridDisplayWidget()
+        self.grid_display = GridDisplayWidget(self.hardware)
         self.tab_widget.addTab(self.grid_display, "Preview Field")
         
         # Add tab widget to left panel
@@ -2829,7 +2803,7 @@ class MainWindow(QMainWindow):
         if reply == QMessageBox.Yes:
             try:
                 # Use the current Z position
-                self.hardware.move_to_absolute(x=x_mm, y=y_mm)
+                self.hardware.move_to_absolute(x=x_mm, y=y_mm, wait_for_completion=True)
                 self.statusBar().showMessage(f"Moving to X={x_mm:.1f}mm, Y={y_mm:.1f}mm")
                 
                 # Also switch to Live View tab to see the camera feed
