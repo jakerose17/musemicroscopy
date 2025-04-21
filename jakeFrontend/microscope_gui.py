@@ -744,8 +744,8 @@ class MicroscopeHardware:
                 "z_zero": 46.3,  # Z zero position in mm (absolute)
             },
             "10X": {
-                "fov_x": 4.8,  # Field of view in mm
-                "fov_y": 4.0,
+                "fov_x": 2.6,  # Field of view in mm
+                "fov_y": 2.15,
                 "z_zero": 8.6,  # Z zero position in mm (absolute)
             }
         }
@@ -1558,7 +1558,7 @@ class MicroscopeHardware:
                 total_frame_time_sec += 0.1  # Add 100ms margin
                 
                 # Try up to 3 times to capture a frame
-                max_attempts = 3
+                max_attempts = 6
                 frame = None
                 
                 for attempt in range(max_attempts):
@@ -1581,10 +1581,9 @@ class MicroscopeHardware:
                         break  # Success, exit the retry loop
                     
                     print(f"[SAVE] Attempt {attempt + 1}/{max_attempts} failed to capture frame, trying again...")
-                    time.sleep(0.5)  # Brief pause between attempts
                 
                 if frame is None:
-                    print("[SAVE] Failed to capture frame after 3 attempts")
+                    print(f"[SAVE] Failed to capture frame after {max_attempts} attempts")
                     return None
             
             # Create a timestamp for the filename
@@ -1741,6 +1740,10 @@ class GridDisplayWidget(QLabel):
         painter = QPainter(self)
         painter.setPen(QPen(Qt.green, 2, Qt.SolidLine))
         
+        #recalulate the box position and size based on the new scale
+        self.current_box_width = self.hardware.fov_x / (self.grid_max_vis_x-self.grid_min_vis_x)
+        self.current_box_height = self.hardware.fov_y / (self.grid_max_vis_y-self.grid_min_vis_y)
+
         if self.show_mosaic and self.mosaic_image is not None:
             # Scale relative to mosaic
             mosaic_height, mosaic_width = self.mosaic_image.shape[:2]
@@ -1755,7 +1758,7 @@ class GridDisplayWidget(QLabel):
             # Calculate offsets to center the mosaic
             offset_x = (widget_width - mosaic_width * scale) / 2
             offset_y = (widget_height - mosaic_height * scale) / 2
-            
+
             # Calculate box position and size in pixels
             box_x = int(offset_x + self.current_x * mosaic_width * scale)
             box_y = int(offset_y + self.current_y * mosaic_height * scale)
@@ -1767,7 +1770,7 @@ class GridDisplayWidget(QLabel):
                 return
                 
             # Calculate the aspect ratio of the grid
-            grid_aspect = self.grid_width / self.grid_height
+            grid_aspect = self.hardware.fov_x / self.hardware.fov_y
             
             # Calculate the maximum size that fits in the widget while maintaining aspect ratio
             widget_width = self.width()
@@ -1804,7 +1807,7 @@ class GridDisplayWidget(QLabel):
         """Draw a red rectangle showing the current region of interest for auto-capture"""
         if not hasattr(self, 'grid_width') or not hasattr(self, 'grid_height'):
             return
-        
+
         # Get pattern size from auto-capture controls
         main_window = self.window()  # Get the main window
         if hasattr(main_window, 'control_panel'):
@@ -1848,7 +1851,7 @@ class GridDisplayWidget(QLabel):
                 return
                 
             # Calculate the aspect ratio of the grid
-            grid_aspect = self.grid_width / self.grid_height
+            grid_aspect = self.hardware.fov_x / self.hardware.fov_y
             
             # Calculate the maximum size that fits in the widget while maintaining aspect ratio
             widget_width = self.width()
@@ -1889,14 +1892,6 @@ class GridDisplayWidget(QLabel):
         # Get click position as percentage of widget size
         click_x = event.x() / self.width()
         click_y = 1.0 - (event.y() / self.height())  # Invert y-axis
-        
-        # Calculate the total field of view including camera FOV
-        if self.current_optic == "4X":
-            fov_x = 12.0  # mm
-            fov_y = 10.0  # mm
-        else:  # 10X
-            fov_x = 4.8   # mm
-            fov_y = 4.0   # mm
             
         # Calculate total field size including camera FOV
         total_field_x = self.grid_max_vis_x - self.grid_min_vis_x
@@ -1958,22 +1953,22 @@ class GridDisplayWidget(QLabel):
         if self.grid_width == 0 or self.grid_height == 0:
             return
             
-        # Calculate the aspect ratio of the grid
-        grid_aspect = self.grid_width / self.grid_height
+        # Calculate the aspect ratio based on FOV dimensions instead of grid dimensions
+        fov_aspect = self.hardware.fov_x / self.hardware.fov_y
         
         # Calculate the maximum size that fits in the widget while maintaining aspect ratio
         widget_width = self.width()
         widget_height = self.height()
         widget_aspect = widget_width / widget_height
         
-        if widget_aspect > grid_aspect:
-            # Widget is wider than grid aspect ratio
+        if widget_aspect > fov_aspect:
+            # Widget is wider than FOV aspect ratio
             cell_height = widget_height / self.grid_height
-            cell_width = cell_height * grid_aspect
+            cell_width = cell_height * fov_aspect
         else:
-            # Widget is taller than grid aspect ratio
+            # Widget is taller than FOV aspect ratio
             cell_width = widget_width / self.grid_width
-            cell_height = cell_width / grid_aspect
+            cell_height = cell_width / fov_aspect
         
         # Center the grid in the widget
         total_width = cell_width * self.grid_width
@@ -2274,8 +2269,8 @@ class ControlPanelWidget(QWidget):
         
         # Stop button
         self.stop_button = QPushButton("Stop Capture")
-        self.stop_button.clicked.connect(lambda: self.parent().stop_capture_processes() if self.parent() else None)
-        self.stop_button.setEnabled(False)  # Initially disabled
+        self.stop_button.clicked.connect(lambda: self.window().stop_capture_processes() if self.window() else None)
+        self.stop_button.setEnabled(False)
         capture_layout.addWidget(self.stop_button, 3, 0, 1, 2)  # span 2 columns
         
         # Capture type
