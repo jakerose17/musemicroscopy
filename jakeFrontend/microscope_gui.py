@@ -245,7 +245,7 @@ class AutoCaptureWorker(QThread):
         self.time_estimates = {
             "Focus Stack": 3.0,
             "XY Pattern": 7.0,
-            "Combined": 5.1
+            "Combined": 5.1,
         }
         
     def run(self):
@@ -1709,16 +1709,16 @@ class GridDisplayWidget(QLabel):
         fov_y = self.hardware.fov_y
         
         # Calculate total field size based on grid dimensions
-        total_field_x = self.grid_width * fov_x
-        total_field_y = self.grid_height * fov_y
+        total_field_x = self.grid_max_vis_x - self.grid_min_vis_x
+        total_field_y = self.grid_max_vis_y - self.grid_min_vis_y
         
         # Calculate position as percentage of total field
-        x_percent = x_mm / total_field_x
-        y_percent = 1.0 - (y_mm / total_field_y)  # Invert y-axis
+        x_percent = (x_mm - self.grid_min_vis_x) / total_field_x
+        y_percent = 1.0 - (y_mm - self.grid_min_vis_y) / total_field_y  # Invert y-axis
         
         # Calculate box size as percentage of total field
-        box_width_percent = fov_x / total_field_x
-        box_height_percent = fov_y / total_field_y
+        box_width_percent = 1/self.grid_width
+        box_height_percent = 1/self.grid_height
         
         # Store the position and size
         self.current_x = x_percent
@@ -1740,14 +1740,62 @@ class GridDisplayWidget(QLabel):
         painter = QPainter(self)
         painter.setPen(QPen(Qt.green, 2, Qt.SolidLine))
         
-        # Calculate box position and size in pixels
-        box_x = int(self.current_x * self.width())
-        box_y = int(self.current_y * self.height())
-        box_width = int(self.current_box_width * self.width())
-        box_height = int(self.current_box_height * self.height())
+        if self.show_mosaic and self.mosaic_image is not None:
+            # Scale relative to mosaic
+            mosaic_height, mosaic_width = self.mosaic_image.shape[:2]
+            widget_width = self.width()
+            widget_height = self.height()
+            
+            # Calculate scaling factors to maintain aspect ratio
+            scale_x = widget_width / mosaic_width
+            scale_y = widget_height / mosaic_height
+            scale = min(scale_x, scale_y)
+            
+            # Calculate offsets to center the mosaic
+            offset_x = (widget_width - mosaic_width * scale) / 2
+            offset_y = (widget_height - mosaic_height * scale) / 2
+            
+            # Calculate box position and size in pixels
+            box_x = int(offset_x + self.current_x * mosaic_width * scale)
+            box_y = int(offset_y + self.current_y * mosaic_height * scale)
+            box_width = int(self.current_box_width * mosaic_width * scale)
+            box_height = int(self.current_box_height * mosaic_height * scale)
+        else:
+            # Scale relative to grid
+            if self.grid_width == 0 or self.grid_height == 0:
+                return
+                
+            # Calculate the aspect ratio of the grid
+            grid_aspect = self.grid_width / self.grid_height
+            
+            # Calculate the maximum size that fits in the widget while maintaining aspect ratio
+            widget_width = self.width()
+            widget_height = self.height()
+            widget_aspect = widget_width / widget_height
+            
+            if widget_aspect > grid_aspect:
+                # Widget is wider than grid aspect ratio
+                cell_height = widget_height / self.grid_height
+                cell_width = cell_height * grid_aspect
+            else:
+                # Widget is taller than grid aspect ratio
+                cell_width = widget_width / self.grid_width
+                cell_height = cell_width / grid_aspect
+            
+            # Center the grid in the widget
+            total_width = cell_width * self.grid_width
+            total_height = cell_height * self.grid_height
+            x_offset = (widget_width - total_width) / 2
+            y_offset = (widget_height - total_height) / 2
+            
+            # Calculate box position and size in pixels
+            box_x = int(x_offset + self.current_x * total_width)
+            box_y = int(y_offset + self.current_y * total_height)
+            box_width = int(self.current_box_width * total_width)
+            box_height = int(self.current_box_height * total_height)
         
         # Draw the box
-        painter.drawRect(box_x, box_y, box_width, box_height)
+        painter.drawRect(int(box_x-box_width/2), int(box_y-box_height/2), box_width, box_height)
         painter.end()
 
     def mousePressEvent(self, event):
@@ -1768,20 +1816,15 @@ class GridDisplayWidget(QLabel):
             fov_y = 4.0   # mm
             
         # Calculate total field size including camera FOV
-        total_field_x = 48.0 + fov_x  # Total field width
-        total_field_y = 48.0 + fov_y  # Total field height
+        total_field_x = self.grid_max_vis_x - self.grid_min_vis_x
+        total_field_y = self.grid_max_vis_y - self.grid_min_vis_y
         
         # Convert percentage to mm coordinates
-        target_x = click_x * total_field_x
-        target_y = click_y * total_field_y
+        target_x = click_x * total_field_x + self.grid_min_vis_x
+        target_y = click_y * total_field_y + self.grid_min_vis_y
         
         # Emit the move signal with the target coordinates
         self.move_to_position.emit(target_x, target_y)
-    
-    def hide_current_position(self):
-        """Hide the current position indicator"""
-        self.show_current_position = False
-        self.update()
             
     def paintEvent(self, event):
         """Draw either the grid of images or the full mosaic"""
@@ -1920,11 +1963,6 @@ class CameraDisplayWidget(QLabel):
         
         # Mouse position
         self.last_mouse_pos = QPoint(0, 0)
-        
-        # Create timers
-        self.fps_timer = QTimer(self)
-        self.fps_timer.timeout.connect(self.update_fps)
-        self.fps_timer.start(1000)  # Update FPS every second
     
     def update_frame(self, frame):
         """Update the display with a new camera frame"""
@@ -1979,28 +2017,6 @@ class CameraDisplayWidget(QLabel):
         move_y = -delta_pixels_y * mm_per_pixel_y
         print(f"Click at image coords: ({image_x:.2f}, {image_y:.2f}); Pixel delta: ({delta_pixels_x:.2f}, {delta_pixels_y:.2f}); Moving stage by: ({move_x:.3f} mm, {move_y:.3f} mm)")
         self.hardware.move_stage(x=move_x, y=move_y, wait_for_completion=False)
-        
-    
-    
-    def toggle_fps_display(self):
-        self.show_fps = not self.show_fps
-        self.update()
-
-    def update_fps(self):
-        """Update FPS counter (called by timer)"""
-        # In case no frames have been received
-        if self.frame_count == 0:
-            self.fps = 0
-            return
-            
-        # Calculate FPS based on frames since last update
-        current_time = time.time()
-        elapsed = current_time - self.last_update_time
-        if elapsed > 0:
-            self.fps = self.frame_count / elapsed
-            self.frame_count = 0
-            self.last_update_time = current_time
-            self.update()  # Trigger a repaint to update FPS display
 
 
 ###############################################################################
@@ -2570,8 +2586,8 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("Microscope Control UI")
         
-        
-       
+        # Initialize overlap percentage for preview field
+        self.overlap_percent = 20.0  # Default 20% overlap
         
         # Initialize hardware
         self.hardware = MicroscopeHardware()
@@ -2719,7 +2735,7 @@ class MainWindow(QMainWindow):
         # Confirm with user before proceeding
         reply = QMessageBox.question(
             self, "Preview Field Scan",
-            f"This will scan the entire field (0-48mm) with the current optic.\n"
+            f"This will scan the entire field with the current optic.\n"
             f"It will move to Z position {self.hardware.z_zero} mm "
             f"and take photos across the field.\n\n"
             f"Do you want to proceed?",
@@ -2735,7 +2751,7 @@ class MainWindow(QMainWindow):
             self._setup_preview_grid()
             
             # Create and start the preview worker
-            self.preview_worker = PreviewFieldWorker(self.hardware, overlap_percent=0)
+            self.preview_worker = PreviewFieldWorker(self.hardware, overlap_percent=self.overlap_percent)
             self.preview_worker.progress_update.connect(self.update_preview_progress)
             self.preview_worker.new_preview_image.connect(self.add_preview_image)
             self.preview_worker.finished_preview.connect(self.preview_completed)
@@ -2750,40 +2766,45 @@ class MainWindow(QMainWindow):
 
     def _setup_preview_grid(self):
         """Initialize the grid display for preview field"""
-        # Use hardware's actual FOV values
-        fov_width = self.hardware.fov_x
-        fov_height = self.hardware.fov_y
+        fov_x = self.hardware.fov_x
+        fov_y = self.hardware.fov_y
+        print(f"Using FOV from hardware: {fov_x}mm x {fov_y}mm for {self.hardware.current_optic}")
+
+        step_x = fov_x * (1 - self.overlap_percent/100.0)
+        step_y = fov_y * (1 - self.overlap_percent/100.0)
         
-        print(f"Using FOV from hardware: {fov_width}mm x {fov_height}mm for {self.hardware.current_optic}")
+        # Calculate number of positions needed
+        count_x = int(np.ceil((self.hardware.max_slide_x-fov_x)/fov_x))
+        count_y = int(np.ceil((self.hardware.max_slide_y-fov_y)/fov_y))
         
-        # Calculate step size with 0% overlap (same as PreviewFieldWorker)
-        step_x = fov_width
-        step_y = fov_height
+        # Calculate total pattern size
+        total_width = step_x * (count_x - 1)
+        total_height = step_y * (count_y - 1)
         
-        # Calculate grid positions the same way PreviewFieldWorker does
-        positions_x = []
-        x_pos = 0  # Start at 0
-        while x_pos <= 48.0:  # Go to 48mm
-            positions_x.append(x_pos)
-            x_pos += step_x
+        # Calculate starting positions (centered on x,y)
+        start_x = self.hardware.motion_stage_center_x - total_width/2 if self.hardware.motion_stage_center_x - total_width/2 > self.hardware.motion_stage_min_x else self.hardware.motion_stage_min_x
+        start_y = self.hardware.motion_stage_center_y - total_height/2 if self.hardware.motion_stage_center_y - total_height/2 > self.hardware.motion_stage_min_y else self.hardware.motion_stage_min_y
         
-        positions_y = []
-        y_pos = 0  # Start at 0
-        while y_pos <= 48.0:  # Go to 48mm
-            positions_y.append(y_pos)
-            y_pos += step_y
+        # Generate position lists
+        positions_x = [start_x + i * step_x for i in range(count_x)]
+        positions_y = [start_y + i * step_y for i in range(count_y)]
         
         # Grid dimensions should match the positions array length
         grid_width = len(positions_x)
         grid_height = len(positions_y)
         
+        self.grid_display.grid_min_vis_x = positions_x[0]-fov_x/2
+        self.grid_display.grid_max_vis_x = positions_x[-1]+fov_x/2
+        self.grid_display.grid_min_vis_y = positions_y[0]-fov_y/2
+        self.grid_display.grid_max_vis_y = positions_y[-1]+fov_y/2
+
         # Initialize grid with exact same dimensions as will be used for capture
         self.grid_display.setup_grid(grid_width, grid_height)
         self.grid_display.clear_grid()
         
         # Update FOV size in grid display for correct green box
-        self.grid_display.current_fov_width = fov_width
-        self.grid_display.current_fov_height = fov_height
+        self.grid_display.current_fov_width = fov_x
+        self.grid_display.current_fov_height = fov_y
         
         # Connect grid click to move stage
         if not hasattr(self, '_grid_connections_setup'):
@@ -2798,6 +2819,15 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Motion controller not available")
             return
         
+        if x_mm<self.hardware.motion_stage_min_x:
+            x_mm = self.hardware.motion_stage_min_x
+        elif x_mm>self.hardware.motion_stage_max_x:
+            x_mm = self.hardware.motion_stage_max_x
+        if y_mm<self.hardware.motion_stage_min_y:
+            y_mm = self.hardware.motion_stage_min_y
+        elif y_mm>self.hardware.motion_stage_max_y:
+            y_mm = self.hardware.motion_stage_max_y
+
         # Confirm move with user
         reply = QMessageBox.question(
             self, "Move Stage",
@@ -2825,14 +2855,14 @@ class MainWindow(QMainWindow):
     def update_preview_progress(self, completed, total, remaining):
         """Update the progress bar during preview field scan"""
         progress = int(100 * completed / total) if total > 0 else 0
-        
+        remaining_time = remaining*7.5
         # Update status bar
-        if remaining > 60:
-            mins = int(remaining / 60)
-            secs = int(remaining % 60)
+        if remaining_time > 60:
+            mins = int(remaining_time / 60)
+            secs = int(remaining_time % 60)
             self.statusBar().showMessage(f"Preview scan: {completed}/{total} positions ({mins}m {secs}s remaining)")
         else:
-            self.statusBar().showMessage(f"Preview scan: {completed}/{total} positions ({int(remaining)}s remaining)")
+            self.statusBar().showMessage(f"Preview scan: {completed}/{total} positions ({int(remaining_time)}s remaining)")
         
         # Update the progress bar in the control panel
         if hasattr(self.control_panel, 'progress_bar'):
@@ -2908,10 +2938,6 @@ class MainWindow(QMainWindow):
                     self.grid_display.update_current_position(x_mm, y_mm, optic)
                 except Exception as e:
                     print(f"Error updating current position: {e}")
-
-    def toggle_fps_display(self):
-        self.camera_display.toggle_fps_display()
-        self.fps_button.setText("Show FPS" if not self.camera_display.show_fps else "Hide FPS")
 
     def closeEvent(self, event):
         # Stop any active preview
