@@ -1668,6 +1668,7 @@ class GridDisplayWidget(QLabel):
         self.current_x = -1  # mm
         self.current_y = -1  # mm
         self.show_current_position = False
+        self.show_current_roi = False
         self.current_fov_width = 12.0  # mm for 4X optic by default
         self.current_fov_height = 10.0  # mm for 4X optic by default
         
@@ -1728,7 +1729,7 @@ class GridDisplayWidget(QLabel):
         
         # Show the current position indicator
         self.show_current_position = True
-        
+        self.show_current_roi = True
         # Update the display
         self.update()
 
@@ -1798,6 +1799,88 @@ class GridDisplayWidget(QLabel):
         painter.drawRect(int(box_x-box_width/2), int(box_y-box_height/2), box_width, box_height)
         painter.end()
 
+
+    def _draw_current_ROI(self):
+        """Draw a red rectangle showing the current region of interest for auto-capture"""
+        if not hasattr(self, 'grid_width') or not hasattr(self, 'grid_height'):
+            return
+        
+        # Get pattern size from auto-capture controls
+        main_window = self.window()  # Get the main window
+        if hasattr(main_window, 'control_panel'):
+            pattern_width = main_window.control_panel.pattern_x_spin.value()
+            pattern_height = main_window.control_panel.pattern_y_spin.value()
+        else:
+            # Default values if control panel not available
+            print("No control panel found - using default pattern size")
+            pattern_width = 15.0
+            pattern_height = 15.0
+
+        scale_width = pattern_width / self.hardware.fov_x
+        scale_height = pattern_height / self.hardware.fov_y
+            
+        painter = QPainter(self)
+        painter.setPen(QPen(Qt.red, 2, Qt.SolidLine))
+        
+        if self.show_mosaic and self.mosaic_image is not None:
+            # Scale relative to mosaic
+            mosaic_height, mosaic_width = self.mosaic_image.shape[:2]
+            widget_width = self.width()
+            widget_height = self.height()
+            
+            # Calculate scaling factors to maintain aspect ratio
+            scale_x = widget_width / mosaic_width
+            scale_y = widget_height / mosaic_height
+            scale = min(scale_x, scale_y)
+            
+            # Calculate offsets to center the mosaic
+            offset_x = (widget_width - mosaic_width * scale) / 2
+            offset_y = (widget_height - mosaic_height * scale) / 2
+            
+            # Calculate box position and size in pixels
+            box_x = int(offset_x + self.current_x * mosaic_width * scale)
+            box_y = int(offset_y + self.current_y * mosaic_height * scale)
+            box_width = int(self.current_box_width * mosaic_width * scale * scale_width)
+            box_height = int(self.current_box_height * mosaic_height * scale * scale_height)
+        else:
+            # Scale relative to grid
+            if self.grid_width == 0 or self.grid_height == 0:
+                return
+                
+            # Calculate the aspect ratio of the grid
+            grid_aspect = self.grid_width / self.grid_height
+            
+            # Calculate the maximum size that fits in the widget while maintaining aspect ratio
+            widget_width = self.width()
+            widget_height = self.height()
+            widget_aspect = widget_width / widget_height
+            
+            if widget_aspect > grid_aspect:
+                # Widget is wider than grid aspect ratio
+                cell_height = widget_height / self.grid_height
+                cell_width = cell_height * grid_aspect
+            else:
+                # Widget is taller than grid aspect ratio
+                cell_width = widget_width / self.grid_width
+                cell_height = cell_width / grid_aspect
+            
+            # Center the grid in the widget
+            total_width = cell_width * self.grid_width
+            total_height = cell_height * self.grid_height
+            x_offset = (widget_width - total_width) / 2
+            y_offset = (widget_height - total_height) / 2
+            
+            # Calculate box position and size in pixels
+            box_x = int(x_offset + self.current_x * total_width)
+            box_y = int(y_offset + self.current_y * total_height)
+            box_width = int(self.current_box_width * total_width * scale_width)
+            box_height = int(self.current_box_height * total_height * scale_height)
+        
+        # Draw the box
+        painter.drawRect(int(box_x-box_width/2), int(box_y-box_height/2), box_width, box_height)
+        painter.end()
+        
+        
     def mousePressEvent(self, event):
         """Handle mouse clicks to move to position"""
         if not self.grid_width or not self.grid_height:
@@ -1838,6 +1921,10 @@ class GridDisplayWidget(QLabel):
         # Draw current position indicator if showing
         if self.show_current_position:
             self._draw_current_position()
+            
+        # Draw current ROI if showing
+        if self.show_current_roi:
+            self._draw_current_ROI()
             
     def _draw_mosaic(self):
         """Draw the full stitched mosaic"""
@@ -2204,6 +2291,7 @@ class ControlPanelWidget(QWidget):
         self.pattern_x_spin.setValue(15.0)
         self.pattern_x_spin.setSingleStep(1.0)
         self.pattern_x_spin.setDecimals(1)
+        self.pattern_x_spin.valueChanged.connect(self._update_roi_display)
         capture_layout.addWidget(self.pattern_x_spin, 5, 1)
         
         # Pattern Size Y
@@ -2213,6 +2301,7 @@ class ControlPanelWidget(QWidget):
         self.pattern_y_spin.setValue(15.0)
         self.pattern_y_spin.setSingleStep(1.0)
         self.pattern_y_spin.setDecimals(1)
+        self.pattern_y_spin.valueChanged.connect(self._update_roi_display)
         capture_layout.addWidget(self.pattern_y_spin, 6, 1)
         
         # Overlap %
@@ -2577,6 +2666,11 @@ class ControlPanelWidget(QWidget):
             # Update the slider based on the current intensity
             self.update_led_slider_from_intensity()
 
+    def _update_roi_display(self):
+        """Update the ROI display when pattern size values change"""
+        if hasattr(self.parent(), 'grid_display'):
+            self.parent().grid_display.update()
+
 
 ###############################################################################
 # MainWindow
@@ -2587,7 +2681,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Microscope Control UI")
         
         # Initialize overlap percentage for preview field
-        self.overlap_percent = 20.0  # Default 20% overlap
+        self.overlap_percent = 0.0  # Default 20% overlap
         
         # Initialize hardware
         self.hardware = MicroscopeHardware()
@@ -2828,29 +2922,20 @@ class MainWindow(QMainWindow):
         elif y_mm>self.hardware.motion_stage_max_y:
             y_mm = self.hardware.motion_stage_max_y
 
-        # Confirm move with user
-        reply = QMessageBox.question(
-            self, "Move Stage",
-            f"Move to position X={x_mm:.1f}mm, Y={y_mm:.1f}mm?",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.Yes
-        )
-        
-        if reply == QMessageBox.Yes:
-            try:
-                # Use the current Z position
-                self.hardware.move_to_absolute(x=x_mm, y=y_mm, wait_for_completion=True)
-                self.statusBar().showMessage(f"Moving to X={x_mm:.1f}mm, Y={y_mm:.1f}mm")
-                
-                # Also switch to Live View tab to see the camera feed
-                self.tab_widget.setCurrentIndex(0)
-            except Exception as e:
-                self.statusBar().showMessage(f"Error moving stage: {e}")
-                QMessageBox.warning(
-                    self, 
-                    "Motion Error", 
-                    f"Could not move to the selected position: {str(e)}"
-                )
+        try:
+            # Use the current Z position
+            self.hardware.move_to_absolute(x=x_mm, y=y_mm, wait_for_completion=False)
+            self.statusBar().showMessage(f"Moving to X={x_mm:.1f}mm, Y={y_mm:.1f}mm")
+            
+            # Also switch to Live View tab to see the camera feed
+            #self.tab_widget.setCurrentIndex(0)
+        except Exception as e:
+            self.statusBar().showMessage(f"Error moving stage: {e}")
+            QMessageBox.warning(
+                self, 
+                "Motion Error", 
+                f"Could not move to the selected position: {str(e)}"
+            )
 
     def update_preview_progress(self, completed, total, remaining):
         """Update the progress bar during preview field scan"""
