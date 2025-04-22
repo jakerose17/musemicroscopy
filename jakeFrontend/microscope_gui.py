@@ -3,11 +3,8 @@ import os
 import time
 import cv2
 import numpy as np
-import json
 from datetime import datetime
 import traceback
-import math
-import re
 import stitch_backend
 
 from ctypes import cdll, c_uint32, c_int, c_double, c_char_p, byref, create_string_buffer
@@ -36,25 +33,40 @@ HISTOGRAM_HEIGHT = 100
 def configure_thorlabs_paths():
     """Configure paths for ThorLabs SDK DLLs"""
     is_64bits = sys.maxsize > 2**32
-    relative_path_to_dlls = os.path.join('Python Toolkit', 'dlls')
     
-    if is_64bits:
-        relative_path_to_dlls = os.path.join(relative_path_to_dlls, '64_lib')
+    # Handle PyInstaller environment
+    if getattr(sys, 'frozen', False):
+        # Running in a PyInstaller bundle
+        application_path = sys._MEIPASS
+        executable_dir = os.path.dirname(sys.executable)
     else:
-        relative_path_to_dlls = os.path.join(relative_path_to_dlls, '32_lib')
+        # Running in normal Python environment
+        application_path = os.path.dirname(os.path.abspath(__file__))
+        executable_dir = application_path
     
-    absolute_path_to_dlls = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), relative_path_to_dlls))
+    # Add multiple possible DLL paths to search, prioritizing the executable directory
+    dll_paths = [
+        executable_dir,  # First try the executable directory
+        os.path.join(application_path, 'Python Toolkit', 'dlls', '64_lib' if is_64bits else '32_lib'),
+        os.path.join(os.getcwd(), 'Python Toolkit', 'dlls', '64_lib' if is_64bits else '32_lib'),
+        os.path.join(os.path.dirname(sys.executable), 'Python Toolkit', 'dlls', '64_lib' if is_64bits else '32_lib')
+    ]
     
-    if os.path.exists(absolute_path_to_dlls):
-        os.environ['PATH'] = absolute_path_to_dlls + os.pathsep + os.environ['PATH']
-        try:
-            # Python 3.8 introduces a new method to specify dll directory
-            os.add_dll_directory(absolute_path_to_dlls)
-        except AttributeError:
-            pass
-        print(f"Added ThorLabs DLL path: {absolute_path_to_dlls}")
-    else:
-        print(f"WARNING: ThorLabs DLL path does not exist: {absolute_path_to_dlls}")
+    dll_found = False
+    for path in dll_paths:
+        if os.path.exists(path):
+            os.environ['PATH'] = path + os.pathsep + os.environ['PATH']
+            try:
+                os.add_dll_directory(path)
+            except AttributeError:
+                pass
+            print(f"Added ThorLabs DLL path: {path}")
+            dll_found = True
+    
+    if not dll_found:
+        print(f"WARNING: Could not find ThorLabs DLLs in any of these paths:")
+        for path in dll_paths:
+            print(f"  - {path}")
 
 # Configure SDK paths before importing
 configure_thorlabs_paths()
